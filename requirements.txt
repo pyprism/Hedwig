@@ -1,1 +1,16 @@
 boto3==1.38.26
+django-debug-toolbar==5.2.0
+Django==5.2.1
+psycopg[binary]==3.2.9
+sentry-sdk==2.29.1
+djangorestframework==3.16.0
+django-cors-headers==4.7.0
+django-filter==25.1
+django-environ==0.12.0
+django-storages[s3]==1.14.6
+ipython==9.2.0
+requests==2.32.3
+drf-yasg==1.21.10
+django-redis==5.4.0
+redis==6.2.0
+uWSGI==2.0.30
