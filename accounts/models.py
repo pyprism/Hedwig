@@ -2,6 +2,8 @@ from django.db import models
 from django.contrib.auth.models import AbstractUser
 import uuid
 
+from accounts.manager import UserManager
+
 
 class User(AbstractUser):
     """
@@ -22,6 +24,8 @@ class User(AbstractUser):
     metadata = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    objects = UserManager()
 
     class Meta:
         db_table = "accounts_user"
