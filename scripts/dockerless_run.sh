@@ -11,6 +11,7 @@ if [ -f ".env" ]; then
   set +a
 fi
 
+
 PYTHON="${PYTHON:-$ROOT_DIR/.venv/bin/python}"
 COMMAND="${1:-server}"
 
@@ -36,6 +37,20 @@ case "$COMMAND" in
     ;;
   server|runserver)
     "$PYTHON" manage.py runserver
+    ;;
+  celery-worker|worker)
+    "$PYTHON" -m celery -A hiren worker \
+      --loglevel="${CELERY_LOGLEVEL:-info}" \
+      --without-gossip \
+      --without-mingle \
+      --without-heartbeat \
+      "${@:2}"
+    ;;
+  celery-beat|beat)
+    "$PYTHON" -m celery -A hiren beat --loglevel="${CELERY_LOGLEVEL:-info}" "${@:2}"
+    ;;
+  celery)
+    "$PYTHON" -m celery -A hiren "${@:2}"
     ;;
   *)
     "$PYTHON" manage.py "$@"
