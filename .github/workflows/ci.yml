@@ -70,7 +70,7 @@ jobs:
       - name: Run tests with coverage
         run: |
           export $(grep -v '^#' .env | xargs)
-          coverage run --source='.' manage.py test
+          coverage run -m pytest
           coverage report
           coverage xml
 
