@@ -163,6 +163,31 @@ class S3ImageUploader:
             logger.error(f"S3 delete failed: {e}")
             return False
 
+    def download_file(self, url):
+        """
+        Download a file's bytes from S3 by its URL.
+
+        Args:
+            url: The full URL of the file to download
+
+        Returns:
+            bytes: The file content, or None on failure
+        """
+        if not self.bucket_name:
+            return None
+
+        try:
+            file_key = self._extract_file_key(url)
+            if file_key is None:
+                return None
+
+            response = self.s3_client.get_object(Bucket=self.bucket_name, Key=file_key)
+            return response["Body"].read()
+
+        except ClientError as e:
+            logger.error(f"S3 download failed: {e}")
+            return None
+
     def generate_presigned_upload_url(
         self, user_id, filename, content_type, category="images", expiration=300
     ):
