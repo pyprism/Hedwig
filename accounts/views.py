@@ -5,6 +5,7 @@ from accounts.filters import UserFilter
 from accounts.models import User
 from accounts.serializers import (
     CurrentUserSerializer,
+    PasswordChangeSerializer,
     RegistrationSerializer,
     UserSerializer,
 )
@@ -20,12 +21,18 @@ class UserViewSet(viewsets.ModelViewSet):
     def get_serializer_class(self):
         if self.action == "register":
             return RegistrationSerializer
-        if not self.request.user.is_staff and self.action in {
-            "retrieve",
-            "update",
-            "partial_update",
-            "me",
-        }:
+        user = getattr(getattr(self, "request", None), "user", None)
+        if (
+            user is not None
+            and not user.is_staff
+            and self.action
+            in {
+                "retrieve",
+                "update",
+                "partial_update",
+                "me",
+            }
+        ):
             return CurrentUserSerializer
         return UserSerializer
 
@@ -70,3 +77,14 @@ class UserViewSet(viewsets.ModelViewSet):
         return response.Response(
             serializer_class(request.user, context=self.get_serializer_context()).data
         )
+
+    @decorators.action(detail=False, methods=["post"], url_path="change-password")
+    def change_password(self, request):
+        serializer = PasswordChangeSerializer(
+            data=request.data,
+            context=self.get_serializer_context(),
+        )
+        serializer.is_valid(raise_exception=True)
+        user = serializer.save()
+        output = CurrentUserSerializer(user, context=self.get_serializer_context())
+        return response.Response(output.data)
