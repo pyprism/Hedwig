@@ -56,6 +56,7 @@ class EmailStatus(models.TextChoices):
     SENDING = "sending", "Sending"
     FAILED = "failed", "Failed"
     RECEIVED = "received", "Received"
+    CANCELLED = "cancelled", "Cancelled"
 
 
 class Folder(models.TextChoices):
