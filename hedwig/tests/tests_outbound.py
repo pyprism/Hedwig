@@ -2,6 +2,8 @@ import pytest
 import base64
 
 from hedwig.models import EmailMessage, EmailAttachment, SuppressedAddress
+from providers.postmark import TransientSendError
+from providers.sending import materialize_attachments
 from providers.models import DailyDomainSendLog
 from utils.enums import EmailStatus, SendAttemptStatus
 
@@ -153,7 +155,17 @@ def test_send_email_response_hides_pending_attachment_content(
     sender_identity,
     requests_mock,
     django_capture_on_commit_callbacks,
+    monkeypatch,
 ):
+    monkeypatch.setattr(
+        "providers.sending.store_attachment_content",
+        lambda *args, **kwargs: (
+            "https://storage.example/secret.txt",
+            "email-attachments/secret.txt",
+            "checksum",
+            len(b"secret file bytes"),
+        ),
+    )
     requests_mock.post(
         "https://api.postmarkapp.com/email",
         json={"MessageID": "postmark-msg-attachment", "ErrorCode": 0, "Message": "OK"},
@@ -180,6 +192,40 @@ def test_send_email_response_hides_pending_attachment_content(
     attachment = EmailAttachment.objects.get(message_id=response.data["id"])
     assert attachment.filename == "secret.txt"
     assert "pending_content_b64" not in response.data["attachments"][0]["metadata"]
+
+
+def test_materialize_attachments_retains_pending_content_when_storage_fails(
+    mailbox, sender_identity, regular_user, monkeypatch
+):
+    content = base64.b64encode(b"secret file bytes").decode()
+    message, _ = EmailMessage.objects.create_outbound_message(
+        mailbox=mailbox,
+        created_by=regular_user,
+        sender_identity=sender_identity,
+        to_addresses=[{"email": "customer@example.com"}],
+        subject="Hello",
+        body_text="Hi there",
+        attachments=[
+            {
+                "filename": "secret.txt",
+                "content_type": "text/plain",
+                "content": content,
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "providers.sending.store_attachment_content",
+        lambda *args, **kwargs: ("", "", "checksum", len(b"secret file bytes")),
+    )
+
+    with pytest.raises(TransientSendError):
+        materialize_attachments(message)
+
+    attachment = message.attachments.get()
+    assert not attachment.file
+    assert not attachment.storage_key
+    assert attachment.checksum_sha256 in ("", None)
+    assert attachment.metadata["pending_content_b64"] == content
 
 
 def test_send_email_requires_body(authed_client, mailbox, sender_identity):
