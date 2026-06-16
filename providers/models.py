@@ -1,6 +1,15 @@
 from django.db import models
 import uuid
 from django.utils import timezone
+
+from providers.manager import (
+    DailyDomainSendLogManager,
+    DeliveryEventManager,
+    DomainDnsRecordManager,
+    DomainManager,
+    EmailProviderManager,
+    ProviderWebhookLogManager,
+)
 from utils.enums import (
     DnsRecordStatus,
     DnsRecordType,
@@ -29,53 +38,64 @@ class EmailProvider(models.Model):
     provider_account_id = models.CharField(
         max_length=255,
         blank=True,
+        null=True,
         help_text="Provider-side account, server, stream, or tenant identifier.",
     )
     region = models.CharField(
         max_length=100,
         blank=True,
+        null=True,
         help_text="Provider region when applicable, e.g. 'us-east-1'.",
     )
     api_base_url = models.URLField(
         blank=True,
+        null=True,
         help_text="Override provider API base URL for regions or private endpoints.",
     )
     credentials = models.JSONField(
         default=dict,
         blank=True,
+        null=True,
         help_text="Provider API credentials. Prefer a vault reference in production.",
     )
     credential_reference = models.CharField(
         max_length=255,
         blank=True,
+        null=True,
         help_text="Secret manager key/path for production credentials.",
     )
     webhook_signing_secret = models.CharField(
         max_length=255,
         blank=True,
+        null=True,
         help_text="Secret used to validate inbound provider webhooks.",
     )
     capabilities = models.JSONField(
         default=dict,
         blank=True,
+        null=True,
         help_text="Feature flags such as inbound, open_tracking, dedicated_ip.",
     )
     default_from_email = models.EmailField(
         blank=True,
+        null=True,
         help_text="Fallback sender used for provider health checks.",
     )
     max_send_per_day = models.PositiveIntegerField(default=0, help_text="0 = unlimited")
     is_sandbox = models.BooleanField(default=False)
     last_health_check_at = models.DateTimeField(null=True, blank=True)
-    last_health_check_error = models.TextField(blank=True)
+    last_health_check_error = models.TextField(blank=True, null=True)
     metadata = models.JSONField(
         default=dict,
         blank=True,
+        null=True,
         help_text="Provider-specific data that does not deserve a dedicated column.",
     )
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    objects = EmailProviderManager()
 
     class Meta:
         db_table = "providers_emailprovider"
@@ -118,6 +138,7 @@ class Domain(models.Model):
     provider_domain_id = models.CharField(
         max_length=255,
         blank=True,
+        null=True,
         help_text="Provider-side domain identifier for reconciliation.",
     )
     outbound_enabled = models.BooleanField(default=True)
@@ -126,11 +147,13 @@ class Domain(models.Model):
     return_path_domain = models.CharField(
         max_length=253,
         blank=True,
+        null=True,
         help_text="Custom bounce/return-path domain when supported.",
     )
     tracking_domain = models.CharField(
         max_length=253,
         blank=True,
+        null=True,
         help_text="Custom click/open tracking domain when supported.",
     )
 
@@ -144,6 +167,7 @@ class Domain(models.Model):
     dns_records = models.JSONField(
         default=dict,
         blank=True,
+        null=True,
         help_text=(
             "Required DNS records as returned by the provider. "
             "Example: { 'spf': '...', 'dkim': {...}, 'mx': [...] }"
@@ -154,6 +178,7 @@ class Domain(models.Model):
     inbound_route = models.CharField(
         max_length=255,
         blank=True,
+        null=True,
         help_text="Inbound webhook route registered with the provider (auto-set on save)",
     )
     webhook_secret = models.CharField(
@@ -171,10 +196,12 @@ class Domain(models.Model):
     is_active = models.BooleanField(default=True)
     verified_at = models.DateTimeField(null=True, blank=True)
     dns_checked_at = models.DateTimeField(null=True, blank=True)
-    last_error = models.TextField(blank=True)
+    last_error = models.TextField(blank=True, null=True)
     metadata = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    objects = DomainManager()
 
     class Meta:
         db_table = "domains_domain"
@@ -216,6 +243,7 @@ class DomainDnsRecord(models.Model):
     purpose = models.CharField(
         max_length=50,
         blank=True,
+        null=True,
         help_text="spf, dkim, dmarc, mx, return_path, tracking, etc.",
     )
     status = models.CharField(
@@ -225,10 +253,12 @@ class DomainDnsRecord(models.Model):
         db_index=True,
     )
     last_checked_at = models.DateTimeField(null=True, blank=True)
-    last_error = models.TextField(blank=True)
-    metadata = models.JSONField(default=dict, blank=True)
+    last_error = models.TextField(blank=True, null=True)
+    metadata = models.JSONField(default=dict, blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    objects = DomainDnsRecordManager()
 
     class Meta:
         db_table = "providers_domaindnsrecord"
@@ -264,6 +294,8 @@ class DailyDomainSendLog(models.Model):
     date = models.DateField(db_index=True)
     sent_count = models.PositiveIntegerField(default=0)
     failed_count = models.PositiveIntegerField(default=0)
+
+    objects = DailyDomainSendLogManager()
 
     class Meta:
         db_table = "providers_dailydomainsendlog"
@@ -303,13 +335,14 @@ class ProviderWebhookLog(models.Model):
     provider_event_id = models.CharField(
         max_length=255,
         blank=True,
+        null=True,
         help_text="Provider event ID used for idempotency.",
     )
     event_type = models.CharField(
         max_length=100,
         help_text="e.g. 'delivery', 'bounce', 'spam_complaint', 'inbound'",
     )
-    headers = models.JSONField(default=dict, blank=True)
+    headers = models.JSONField(default=dict, blank=True, null=True)
     payload = models.JSONField(
         default=dict, help_text="Full raw payload from the provider"
     )
@@ -319,11 +352,13 @@ class ProviderWebhookLog(models.Model):
         default=ProviderWebhookStatus.PENDING,
     )
     signature_valid = models.BooleanField(null=True, blank=True)
-    error_message = models.TextField(blank=True)
+    error_message = models.TextField(blank=True, null=True)
     attempt_count = models.PositiveSmallIntegerField(default=0)
     received_at = models.DateTimeField(auto_now_add=True)
     locked_at = models.DateTimeField(null=True, blank=True)
     processed_at = models.DateTimeField(null=True, blank=True)
+
+    objects = ProviderWebhookLogManager()
 
     class Meta:
         db_table = "providers_webhooklog"
@@ -362,13 +397,13 @@ class DeliveryEvent(models.Model):
     event_type = models.CharField(max_length=20, choices=EventType.choices)
     provider_event_id = models.CharField(max_length=255, blank=True)
     # For bounces / failures
-    reason = models.TextField(blank=True)
+    reason = models.TextField(blank=True, null=True)
     # For click tracking
-    link_url = models.URLField(blank=True)
+    link_url = models.URLField(blank=True, null=True)
     # Recipient that triggered the event (in multi-recipient sends)
-    recipient = models.EmailField(blank=True)
+    recipient = models.EmailField(blank=True, null=True)
     occurred_at = models.DateTimeField()
-    metadata = models.JSONField(default=dict, blank=True)
+    metadata = models.JSONField(default=dict, blank=True, null=True)
     raw_webhook = models.ForeignKey(
         ProviderWebhookLog,
         on_delete=models.SET_NULL,
@@ -376,6 +411,8 @@ class DeliveryEvent(models.Model):
         blank=True,
         related_name="delivery_events",
     )
+
+    objects = DeliveryEventManager()
 
     class Meta:
         db_table = "providers_deliveryevent"
