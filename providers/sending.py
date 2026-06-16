@@ -68,6 +68,10 @@ def materialize_attachments(message):
             file_url, storage_key, checksum, size_bytes = store_attachment_content(
                 message.mailbox_id, attachment.filename, pending_content_b64
             )
+            if not file_url:
+                raise TransientSendError(
+                    f"Could not store attachment '{attachment.filename}' before sending."
+                )
             attachment.file = file_url
             attachment.storage_key = storage_key
             attachment.checksum_sha256 = checksum or None
