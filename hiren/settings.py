@@ -12,15 +12,17 @@ https://docs.djangoproject.com/en/6.0/ref/settings/
 
 from pathlib import Path
 import os
-from pathlib import Path
 from datetime import timedelta
 
+from django.core.exceptions import ImproperlyConfigured
 import sentry_sdk
+from kombu import Exchange, Queue
 from sentry_sdk.integrations.celery import CeleryIntegration
 from sentry_sdk.integrations.django import DjangoIntegration
 
 from utils.cors_generator import generate_cors_regex_from_hosts
 from utils.ip import get_local_ip
+from utils.env import require_env
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -29,11 +31,16 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
 
-# SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = os.environ.get("secret_key")
-
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.environ.get("debug", "False").lower() == "true"
+
+# SECURITY WARNING: keep the secret key used in production secret!
+SECRET_KEY = os.environ.get("secret_key")
+if not SECRET_KEY:
+    raise ImproperlyConfigured(
+        "The 'secret_key' environment variable must be set when debug=False."
+    )
+
 
 allowed_hosts_value = os.environ.get("allowed_hosts", "")
 if allowed_hosts_value:
@@ -42,6 +49,19 @@ if allowed_hosts_value:
     ]
 else:
     ALLOWED_HOSTS = []
+
+# Production security hardening (no-ops in DEBUG so local dev over http keeps working)
+if not DEBUG:
+    SECURE_SSL_REDIRECT = True
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_HSTS_SECONDS = int(os.environ.get("secure_hsts_seconds", 60 * 60 * 24 * 365))
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = True
+
+SECURE_CONTENT_TYPE_NOSNIFF = True
+X_FRAME_OPTIONS = "DENY"
 
 
 # Application definition
@@ -66,6 +86,7 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     "corsheaders.middleware.CorsMiddleware",
     "django.middleware.security.SecurityMiddleware",
+    "utils.middleware.RequestIDMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -103,11 +124,11 @@ WSGI_APPLICATION = "hiren.wsgi.application"
 
 DATABASES = {
     "default": {
-        "NAME": os.environ.get("db_name"),
+        "NAME": require_env("db_name"),
         "ENGINE": "django.db.backends.postgresql",
-        "USER": os.environ.get("db_user"),
-        "PASSWORD": os.environ.get("db_password"),
-        "HOST": os.environ.get("db_host"),
+        "USER": require_env("db_user"),
+        "PASSWORD": require_env("db_password"),
+        "HOST": require_env("db_host"),
         "PORT": os.environ.get("db_port", "5432"),
         # "CONN_MAX_AGE": 600,
         "OPTIONS": {
@@ -178,23 +199,27 @@ LOGGING = {
     "filters": {
         "require_debug_false": {"()": "django.utils.log.RequireDebugFalse"},
         "require_debug_true": {"()": "django.utils.log.RequireDebugTrue"},
+        "request_id": {"()": "utils.logging.RequestIDFilter"},
     },
     "formatters": {
         "main_formatter": {
             "format": "%(levelname)s:%(name)s: %(message)s "
-            "(%(asctime)s; %(filename)s:%(lineno)d)",
+            "[request_id=%(request_id)s] (%(asctime)s; %(filename)s:%(lineno)d)",
             "datefmt": "%d-%m-%Y %H:%M:%S",
+        },
+        "json_formatter": {
+            "()": "utils.logging.JSONFormatter",
         },
     },
     "handlers": {
         "mail_admins": {
             "level": "ERROR",
-            "filters": ["require_debug_false"],
+            "filters": ["require_debug_false", "request_id"],
             "class": "django.utils.log.AdminEmailHandler",
         },
         "console": {
             "level": "DEBUG",
-            "filters": ["require_debug_true"],
+            "filters": ["require_debug_true", "request_id"],
             "class": "logging.StreamHandler",
             "formatter": "main_formatter",
         },
@@ -204,8 +229,8 @@ LOGGING = {
             "filename": BASE_DIR / "logs/main.log",
             "maxBytes": 1024 * 1024 * 5,  # 5 MB
             "backupCount": 7,
-            "formatter": "main_formatter",
-            "filters": ["require_debug_false"],
+            "formatter": "json_formatter",
+            "filters": ["require_debug_false", "request_id"],
         },
         "debug_file": {
             "level": "DEBUG",
@@ -214,7 +239,7 @@ LOGGING = {
             "maxBytes": 1024 * 1024 * 5,  # 5 MB
             "backupCount": 7,
             "formatter": "main_formatter",
-            "filters": ["require_debug_true"],
+            "filters": ["require_debug_true", "request_id"],
         },
         "null": {
             "class": "logging.NullHandler",
@@ -261,7 +286,11 @@ if DEBUG:
     )
 
 REST_FRAMEWORK = {
-    "DEFAULT_FILTER_BACKENDS": ["django_filters.rest_framework.DjangoFilterBackend"],
+    "DEFAULT_FILTER_BACKENDS": [
+        "utils.filters.SchemaDjangoFilterBackend",
+        "rest_framework.filters.OrderingFilter",
+        "rest_framework.filters.SearchFilter",
+    ],
     "DEFAULT_THROTTLE_CLASSES": (
         "rest_framework.throttling.AnonRateThrottle",
         "rest_framework.throttling.UserRateThrottle",
@@ -269,6 +298,7 @@ REST_FRAMEWORK = {
     "DEFAULT_THROTTLE_RATES": {
         "anon": "60/minute",
         "user": "40/minute",
+        "provider-webhook": "120/minute",
     },
     "DEFAULT_PARSER_CLASSES": (
         "rest_framework.parsers.JSONParser",
@@ -276,23 +306,28 @@ REST_FRAMEWORK = {
         "rest_framework.parsers.MultiPartParser",
     ),
     "DEFAULT_RENDERER_CLASSES": DEFAULT_RENDERER_CLASSES,
-    "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
+    "DEFAULT_PAGINATION_CLASS": "utils.pagination.HedwigPageNumberPagination",
     "PAGE_SIZE": 20,
+    "COERCE_DECIMAL_TO_STRING": False,
     "DEFAULT_AUTHENTICATION_CLASSES": [
         "rest_framework_simplejwt.authentication.JWTAuthentication",
         "rest_framework.authentication.SessionAuthentication",
     ],
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.IsAuthenticated",
+        "utils.permissions.MustChangePasswordPermission",
     ],
+    "EXCEPTION_HANDLER": "utils.exceptions.custom_exception_handler",
 }
 
 # sentry for error tracking
 if not DEBUG:
     sentry_sdk.init(
         dsn=os.environ.get("sentry_dsn"),
-        send_default_pii=True,
-        traces_sample_rate=1.0,
+        # This is a mail product - request bodies routinely contain message, secret content from your gf and
+        # recipient addresses, so never send PII to Sentry.
+        send_default_pii=False,
+        traces_sample_rate=float(os.environ.get("sentry_traces_sample_rate", "0.0")),
         integrations=[DjangoIntegration(), CeleryIntegration()],
     )
 
@@ -303,17 +338,29 @@ if DEBUG:
     CORS_ORIGIN_ALLOW_ALL = True
 
 # AWS S3 Settings
-AWS_ACCESS_KEY_ID = os.environ.get("aws_access_key_id")
-AWS_SECRET_ACCESS_KEY = os.environ.get("aws_secret_access_key")
-AWS_STORAGE_BUCKET_NAME = os.environ.get("aws_storage_bucket_name")
+if DEBUG:
+    AWS_ACCESS_KEY_ID = os.environ.get("aws_access_key_id")
+    AWS_SECRET_ACCESS_KEY = os.environ.get("aws_secret_access_key")
+    AWS_STORAGE_BUCKET_NAME = os.environ.get("aws_storage_bucket_name")
+else:
+    AWS_ACCESS_KEY_ID = require_env("aws_access_key_id")
+    AWS_SECRET_ACCESS_KEY = require_env("aws_secret_access_key")
+    AWS_STORAGE_BUCKET_NAME = require_env("aws_storage_bucket_name")
 AWS_S3_REGION_NAME = os.environ.get("aws_s3_region_name")
 AWS_S3_CUSTOM_DOMAIN = os.environ.get("aws_s3_custom_domain")
 AWS_S3_ENDPOINT_URL = os.environ.get("aws_s3_endpoint_url")
 AWS_S3_FILE_OVERWRITE = False
 AWS_DEFAULT_ACL = None
 
-# enable/disable registration using public endpoints
-REGISTRATION_OPEN = os.environ.get("registration_open", "true").lower() == "true"
+# Enable/disable self-service registration on POST /api/accounts/users/register/.
+# Defaults to open in DEBUG (so local dev can bootstrap an admin user) and
+# closed in prod. To bootstrap the first/admin user in prod, either run
+# `manage.py createsuperuser`, or temporarily set registration_open=true,
+# register the first account (which becomes staff/superuser automatically),
+# then set registration_open=false again.
+REGISTRATION_OPEN = (
+    os.environ.get("registration_open", "true" if DEBUG else "false").lower() == "true"
+)
 
 # JWT
 SIMPLE_JWT = {
@@ -331,9 +378,12 @@ SIMPLE_JWT = {
 }
 
 # Celery
-CELERY_BROKER_URL = os.environ.get(
-    "rabbitmq_url", "amqp://guest:guest@localhost:5672//"
-)
+if DEBUG:
+    CELERY_BROKER_URL = os.environ.get(
+        "rabbitmq_url", "amqp://guest:guest@localhost:5672//"
+    )
+else:
+    CELERY_BROKER_URL = require_env("rabbitmq_url")
 CELERY_RESULT_BACKEND = "django-db"
 CELERY_CACHE_BACKEND = "django-cache"
 
@@ -341,6 +391,24 @@ CELERY_CACHE_BACKEND = "django-cache"
 CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_SERIALIZER = "json"
 CELERY_ACCEPT_CONTENT = ["json"]
+CELERY_TASK_DEFAULT_QUEUE = "hedwig.default"
+CELERY_TASK_DEFAULT_EXCHANGE = "hedwig"
+CELERY_TASK_DEFAULT_EXCHANGE_TYPE = "direct"
+CELERY_TASK_DEFAULT_ROUTING_KEY = "hedwig.default"
+CELERY_TASK_DEFAULT_DELIVERY_MODE = "persistent"
+CELERY_TASK_CREATE_MISSING_QUEUES = False
+CELERY_TASK_QUEUES = (
+    Queue(
+        CELERY_TASK_DEFAULT_QUEUE,
+        Exchange(
+            CELERY_TASK_DEFAULT_EXCHANGE,
+            type=CELERY_TASK_DEFAULT_EXCHANGE_TYPE,
+            durable=True,
+        ),
+        routing_key=CELERY_TASK_DEFAULT_ROUTING_KEY,
+        durable=True,
+    ),
+)
 
 # Reliability
 CELERY_TASK_TRACK_STARTED = True
@@ -350,6 +418,7 @@ CELERY_WORKER_PREFETCH_MULTIPLIER = 1  # fair dispatch — one task at a time pe
 CELERY_WORKER_MAX_TASKS_PER_CHILD = 1000  # recycle workers to prevent memory leaks
 CELERY_WORKER_ENABLE_REMOTE_CONTROL = False  # avoid deprecated transient pidbox queues
 CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
+CELERY_WORKER_CANCEL_LONG_RUNNING_TASKS_ON_CONNECTION_LOSS = True
 
 # Results TTL
 CELERY_RESULT_EXPIRES = timedelta(days=15)
@@ -357,13 +426,40 @@ CELERY_RESULT_EXPIRES = timedelta(days=15)
 # Timezone (inherit from Django)
 CELERY_TIMEZONE = os.environ.get("time_zone", "UTC")
 CELERY_ENABLE_UTC = True
-FAILED_ANALYSIS_RETRY_INTERVAL_SECONDS = int(
-    os.environ.get("failed_analysis_retry_seconds", 3600)
+
+# Background-job tuning
+PROVIDER_HEALTH_CHECK_INTERVAL_MINUTES = int(
+    os.environ.get("provider_health_check_interval_minutes", 15)
 )
+WEBHOOK_LOG_RETRY_STALE_MINUTES = int(
+    os.environ.get("webhook_log_retry_stale_minutes", 30)
+)
+WEBHOOK_LOG_MAX_ATTEMPTS = int(os.environ.get("webhook_log_max_attempts", 10))
+DAILY_SEND_LOG_RETENTION_DAYS = int(os.environ.get("daily_send_log_retention_days", 90))
 
 CELERY_BEAT_SCHEDULE = {
-    "retry-failed-diary-analyses-hourly": {
-        "task": "diary.tasks.retry_failed_diary_analyses_task",
-        "schedule": timedelta(seconds=FAILED_ANALYSIS_RETRY_INTERVAL_SECONDS),
-    }
+    "check-provider-health": {
+        "task": "providers.tasks.check_all_providers_health_task",
+        "schedule": timedelta(minutes=PROVIDER_HEALTH_CHECK_INTERVAL_MINUTES),
+    },
+    "expire-user-mailbox-access": {
+        "task": "hedwig.tasks.expire_user_mailbox_access_task",
+        "schedule": timedelta(minutes=15),
+    },
+    "expire-suppressed-addresses": {
+        "task": "hedwig.tasks.expire_suppressed_addresses_task",
+        "schedule": timedelta(hours=1),
+    },
+    "retry-stale-webhook-logs": {
+        "task": "providers.tasks.retry_stale_webhook_logs_task",
+        "schedule": timedelta(minutes=WEBHOOK_LOG_RETRY_STALE_MINUTES),
+    },
+    "cleanup-daily-send-logs": {
+        "task": "providers.tasks.cleanup_daily_send_logs_task",
+        "schedule": timedelta(days=1),
+    },
+    "reconcile-mailbox-used-bytes": {
+        "task": "hedwig.tasks.reconcile_mailbox_used_bytes_task",
+        "schedule": timedelta(hours=6),
+    },
 }
