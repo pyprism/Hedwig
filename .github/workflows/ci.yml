@@ -31,6 +31,7 @@ jobs:
 
     env:
       debug: "true"
+      secret_key: ci-secret-key
       db_name: hedwig
       db_user: hedwig
       db_password: hedwig
