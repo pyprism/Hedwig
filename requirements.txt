@@ -17,3 +17,7 @@ django-storages[s3]==1.14.6
 djangorestframework-simplejwt==5.5.1
 django-cors-headers==4.9.0
 coverage==7.14.1
+inflection==0.5.1
+uritemplate==4.2.0
+ruff==0.15.17
+PyYAML==6.0.3
