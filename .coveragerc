@@ -1,3 +1,17 @@
 [run]
-source = base/
-         mail/
+source =
+    accounts
+    hedwig
+    providers
+    utils
+    hiren
+omit =
+    */migrations/*
+    */tests.py
+    */tests/*
+    manage.py
+
+[report]
+show_missing = True
+skip_covered = False
+fail_under = 60

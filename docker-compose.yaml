@@ -1,0 +1,98 @@
+services:
+  celery_worker:
+    build:
+      context: .
+      target: production
+    container_name: hedwig_celery_worker
+    restart: unless-stopped
+    command: >
+      celery -A hiren worker
+        --loglevel=info
+        --concurrency=2
+        --max-tasks-per-child=1000
+        --without-gossip
+        --without-mingle
+    env_file: .env
+    environment:
+      db_host: host.docker.internal
+      rabbitmq_url: ${rabbitmq_url}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - logs:/app/logs
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
+
+  celery_beat:
+    build:
+      context: .
+      target: production
+    container_name: hedwig_celery_beat
+    restart: unless-stopped
+    command: >
+      celery -A hiren beat
+        --loglevel=info
+        --schedule=/app/run/celerybeat-schedule
+    env_file: .env
+    environment:
+      db_host: host.docker.internal
+      rabbitmq_url: ${rabbitmq_url}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - logs:/app/logs
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 64M
+
+  web:
+    build:
+      context: .
+      target: production          # use the final multi-stage target
+    container_name: hedwig_api
+    restart: unless-stopped
+
+    env_file: .env                # loads secret_key, db_*, allowed_hosts, etc.
+    environment:
+      # Override db_host so Django talks to the Linux host's PostgreSQL.
+      # host.docker.internal resolves to the host IP automatically on Linux Docker.
+      db_host: host.docker.internal
+      rabbitmq_url: ${rabbitmq_url}
+
+    # networking
+    # Keep the container in its own network; reach host PG via extra_hosts.
+    ports:
+      - "127.0.0.1:${server_port}:8000"    # only expose to localhost; put nginx in front
+
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    volumes:
+      - static:/app/staticfiles
+      - logs:/app/logs
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h host.docker.internal -U $$db_user -d $$db_name"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
+
+volumes:
+  logs:
+  static:
