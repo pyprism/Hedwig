@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# example commands ./scripts/dockerless_run.sh runserver
+
+
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
@@ -51,6 +54,9 @@ case "$COMMAND" in
     ;;
   celery)
     "$PYTHON" -m celery -A hiren "${@:2}"
+    ;;
+  test)
+    "$PYTHON" -m pytest -vv
     ;;
   *)
     "$PYTHON" manage.py "$@"
