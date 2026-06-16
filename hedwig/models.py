@@ -7,6 +7,23 @@ from django.db.models import Q
 from django.db.models.functions import Lower
 from django.utils import timezone
 
+from hedwig.manager import (
+    ContactManager,
+    EmailAttachmentManager,
+    EmailLabelManager,
+    EmailMessageLabelManager,
+    EmailMessageManager,
+    EmailMessageUserStateManager,
+    EmailRecipientManager,
+    EmailThreadManager,
+    MailboxAliasManager,
+    MailboxManager,
+    MailboxRuleManager,
+    OutboundSendAttemptManager,
+    SenderIdentityManager,
+    SuppressedAddressManager,
+    UserMailboxAccessManager,
+)
 from utils.enums import (
     AccessType,
     DirectionType,
@@ -57,9 +74,10 @@ class Mailbox(models.Model):
     )
     forward_to = models.EmailField(
         blank=True,
+        null=True,
         help_text="If set, incoming mail is also forwarded to this external address",
     )
-    reply_to = models.EmailField(blank=True)
+    reply_to = models.EmailField(blank=True, null=True)
     send_enabled = models.BooleanField(default=True)
     receive_enabled = models.BooleanField(default=True)
     quota_bytes = models.BigIntegerField(
@@ -67,23 +85,27 @@ class Mailbox(models.Model):
         help_text="0 = unlimited. Enforce while storing inbound mail and attachments.",
     )
     used_bytes = models.BigIntegerField(default=0)
-    signature_html = models.TextField(blank=True)
-    signature_text = models.TextField(blank=True)
+    signature_html = models.TextField(blank=True, null=True)
+    signature_text = models.TextField(blank=True, null=True)
     provider_sender_id = models.CharField(
         max_length=255,
         blank=True,
+        null=True,
         help_text="Provider-side sender or stream identifier if applicable.",
     )
-    metadata = models.JSONField(default=dict, blank=True)
+    metadata = models.JSONField(default=dict, blank=True, null=True)
 
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    objects = MailboxManager()
+
     class Meta:
         db_table = "mailboxes_mailbox"
         verbose_name = "Mailbox"
         verbose_name_plural = "Mailboxes"
+        ordering = ["-created_at"]
         # Enforce uniqueness of the full address within a domain
         constraints = [
             models.UniqueConstraint(
@@ -128,13 +150,15 @@ class MailboxAlias(models.Model):
         related_name="mailbox_aliases",
     )
     local_part = models.CharField(max_length=64, validators=[local_part_validator])
-    display_name = models.CharField(max_length=150, blank=True)
+    display_name = models.CharField(max_length=150, blank=True, null=True)
     can_send = models.BooleanField(default=True)
     can_receive = models.BooleanField(default=True)
     is_active = models.BooleanField(default=True)
-    metadata = models.JSONField(default=dict, blank=True)
+    metadata = models.JSONField(default=dict, blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    objects = MailboxAliasManager()
 
     class Meta:
         db_table = "mailboxes_alias"
@@ -200,15 +224,17 @@ class SenderIdentity(models.Model):
         related_name="sender_identities",
     )
     email = models.EmailField()
-    display_name = models.CharField(max_length=150, blank=True)
-    reply_to = models.EmailField(blank=True)
-    signature_html = models.TextField(blank=True)
-    signature_text = models.TextField(blank=True)
+    display_name = models.CharField(max_length=150, blank=True, null=True)
+    reply_to = models.EmailField(blank=True, null=True)
+    signature_html = models.TextField(blank=True, null=True)
+    signature_text = models.TextField(blank=True, null=True)
     is_default = models.BooleanField(default=False)
     is_active = models.BooleanField(default=True)
-    metadata = models.JSONField(default=dict, blank=True)
+    metadata = models.JSONField(default=dict, blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    objects = SenderIdentityManager()
 
     class Meta:
         db_table = "mailboxes_senderidentity"
@@ -292,6 +318,8 @@ class UserMailboxAccess(models.Model):
     )
     is_active = models.BooleanField(default=True)
 
+    objects = UserMailboxAccessManager()
+
     class Meta:
         db_table = "mailboxes_usermailboxaccess"
         verbose_name = "User Mailbox Access"
@@ -365,10 +393,11 @@ class EmailThread(models.Model):
         related_name="threads",
     )
     subject = models.CharField(max_length=998, blank=True, null=True)
-    normalized_subject = models.CharField(max_length=998, blank=True)
+    normalized_subject = models.CharField(max_length=998, blank=True, null=True)
     root_message_id = models.CharField(
         max_length=255,
         blank=True,
+        null=True,
         db_index=True,
         help_text="Message-ID that started the conversation, when known.",
     )
@@ -378,6 +407,8 @@ class EmailThread(models.Model):
     has_unread = models.BooleanField(default=True, db_index=True)
     last_message_at = models.DateTimeField(null=True, blank=True, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)
+
+    objects = EmailThreadManager()
 
     class Meta:
         db_table = "emails_thread"
@@ -457,10 +488,12 @@ class EmailMessage(models.Model):
     from_name = models.CharField(max_length=255, blank=True, null=True)
     envelope_sender = models.EmailField(
         blank=True,
+        null=True,
         help_text="SMTP MAIL FROM / return-path address.",
     )
     envelope_recipient = models.EmailField(
         blank=True,
+        null=True,
         help_text="SMTP RCPT TO that caused delivery to this mailbox.",
     )
     to_addresses = models.JSONField(
@@ -469,8 +502,8 @@ class EmailMessage(models.Model):
     )
     cc_addresses = models.JSONField(default=list)
     bcc_addresses = models.JSONField(default=list)
-    reply_to = models.EmailField(blank=True)
-    subject = models.CharField(max_length=998, blank=True)
+    reply_to = models.EmailField(blank=True, null=True)
+    subject = models.CharField(max_length=998, blank=True, null=True)
 
     # Threading headers
     in_reply_to = models.CharField(
@@ -486,15 +519,16 @@ class EmailMessage(models.Model):
     )
 
     #  Body
-    body_text = models.TextField(blank=True, help_text="Plain-text part")
-    body_html = models.TextField(blank=True, help_text="HTML part")
-    snippet = models.CharField(max_length=500, blank=True)
+    body_text = models.TextField(blank=True, null=True, help_text="Plain-text part")
+    body_html = models.TextField(blank=True, null=True, help_text="HTML part")
+    snippet = models.CharField(max_length=500, blank=True, null=True)
     raw_headers = models.JSONField(
         default=dict,
         help_text="All raw MIME headers preserved for debugging / compliance",
     )
     raw_mime_url = models.URLField(
         blank=True,
+        null=True,
         help_text="Object-storage URL for the raw MIME source, if retained.",
     )
 
@@ -522,7 +556,7 @@ class EmailMessage(models.Model):
     spam_score = models.DecimalField(
         max_digits=6, decimal_places=3, null=True, blank=True
     )
-    metadata = models.JSONField(default=dict, blank=True)
+    metadata = models.JSONField(default=dict, blank=True, null=True)
 
     # Timestamps
     scheduled_at = models.DateTimeField(null=True, blank=True)
@@ -530,6 +564,8 @@ class EmailMessage(models.Model):
     received_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    objects = EmailMessageManager()
 
     class Meta:
         db_table = "emails_message"
@@ -580,7 +616,7 @@ class EmailRecipient(models.Model):
     )
     recipient_type = models.CharField(max_length=10, choices=RecipientType.choices)
     email = models.EmailField()
-    name = models.CharField(max_length=255, blank=True)
+    name = models.CharField(max_length=255, blank=True, null=True)
     delivered_to_mailbox = models.ForeignKey(
         Mailbox,
         on_delete=models.SET_NULL,
@@ -589,16 +625,18 @@ class EmailRecipient(models.Model):
         related_name="delivered_recipient_rows",
         help_text="Mailbox this recipient mapped to for inbound delivery.",
     )
-    provider_recipient_id = models.CharField(max_length=255, blank=True)
+    provider_recipient_id = models.CharField(max_length=255, blank=True, null=True)
     status = models.CharField(
         max_length=15,
         choices=EmailStatus.choices,
         default=EmailStatus.QUEUED,
         db_index=True,
     )
-    metadata = models.JSONField(default=dict, blank=True)
+    metadata = models.JSONField(default=dict, blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    objects = EmailRecipientManager()
 
     class Meta:
         db_table = "emails_recipient"
@@ -649,9 +687,11 @@ class EmailMessageUserState(models.Model):
     snoozed_until = models.DateTimeField(null=True, blank=True)
     deleted_at = models.DateTimeField(null=True, blank=True)
     last_seen_at = models.DateTimeField(null=True, blank=True)
-    metadata = models.JSONField(default=dict, blank=True)
+    metadata = models.JSONField(default=dict, blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    objects = EmailMessageUserStateManager()
 
     class Meta:
         db_table = "emails_messageuserstate"
@@ -697,15 +737,24 @@ class OutboundSendAttempt(models.Model):
         default=SendAttemptStatus.PENDING,
         db_index=True,
     )
-    provider_message_id = models.CharField(max_length=255, blank=True)
-    idempotency_key = models.CharField(max_length=255, blank=True)
-    request_payload = models.JSONField(default=dict, blank=True)
-    response_payload = models.JSONField(default=dict, blank=True)
-    error_code = models.CharField(max_length=100, blank=True)
-    error_message = models.TextField(blank=True)
+    provider_message_id = models.CharField(max_length=255, blank=True, null=True)
+    idempotency_key = models.CharField(max_length=255, blank=True, null=True)
+    request_payload = models.JSONField(default=dict, blank=True, null=True)
+    response_payload = models.JSONField(default=dict, blank=True, null=True)
+    error_code = models.CharField(
+        max_length=100,
+        blank=True,
+        null=True,
+    )
+    error_message = models.TextField(
+        blank=True,
+        null=True,
+    )
     started_at = models.DateTimeField(null=True, blank=True)
     finished_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+
+    objects = OutboundSendAttemptManager()
 
     class Meta:
         db_table = "emails_outboundsendattempt"
@@ -750,19 +799,22 @@ class EmailAttachment(models.Model):
         max_length=100, help_text="MIME type, e.g. image/png"
     )
     size_bytes = models.PositiveIntegerField()
-    file = models.URLField()
+    file = models.URLField(blank=True, null=True)
     storage_key = models.CharField(
         max_length=1024,
         blank=True,
+        null=True,
         help_text="Object storage key/path for provider-independent access.",
     )
-    checksum_sha256 = models.CharField(max_length=64, blank=True)
+    checksum_sha256 = models.CharField(max_length=64, blank=True, null=True)
     # For inline images referenced in HTML body via cid:
     content_id = models.CharField(max_length=255, blank=True, null=True)
-    content_disposition = models.CharField(max_length=100, blank=True)
+    content_disposition = models.CharField(max_length=100, blank=True, null=True)
     is_inline = models.BooleanField(default=False)
-    metadata = models.JSONField(default=dict, blank=True)
+    metadata = models.JSONField(default=dict, blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
+
+    objects = EmailAttachmentManager()
 
     class Meta:
         db_table = "emails_attachment"
@@ -793,6 +845,8 @@ class EmailLabel(models.Model):
         max_length=7, default="#3B82F6", help_text="Hex color code"
     )
     created_at = models.DateTimeField(auto_now_add=True)
+
+    objects = EmailLabelManager()
 
     class Meta:
         db_table = "emails_label"
@@ -826,6 +880,8 @@ class EmailMessageLabel(models.Model):
         related_name="message_labels",
     )
     added_at = models.DateTimeField(auto_now_add=True)
+
+    objects = EmailMessageLabelManager()
 
     class Meta:
         db_table = "emails_messagelabel"
@@ -871,6 +927,8 @@ class MailboxRule(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    objects = MailboxRuleManager()
+
     class Meta:
         db_table = "mailboxes_rule"
         verbose_name = "Mailbox Rule"
@@ -911,10 +969,11 @@ class SuppressedAddress(models.Model):
         help_text="Blank means the suppression applies to the whole domain.",
     )
     email = models.EmailField()
-    reason = models.CharField(max_length=100, blank=True)
+    reason = models.CharField(max_length=100, blank=True, null=True)
     source = models.CharField(
         max_length=100,
         blank=True,
+        null=True,
         help_text="unsubscribe, bounce, complaint, admin, import, etc.",
     )
     raw_event = models.ForeignKey(
@@ -926,6 +985,8 @@ class SuppressedAddress(models.Model):
     )
     expires_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+
+    objects = SuppressedAddressManager()
 
     class Meta:
         db_table = "emails_suppressedaddress"
@@ -966,3 +1027,51 @@ class SuppressedAddress(models.Model):
             and self.mailbox.domain_id != self.domain_id
         ):
             raise ValidationError("Suppression domain must match the mailbox domain.")
+
+
+class Contact(models.Model):
+    """
+    Address-book entry for a mailbox, populated automatically as the mailbox
+    sends mail (and editable directly) so addresses can be reused later.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    mailbox = models.ForeignKey(
+        Mailbox,
+        on_delete=models.CASCADE,
+        related_name="contacts",
+    )
+    email = models.EmailField()
+    name = models.CharField(max_length=255, blank=True)
+    is_favorite = models.BooleanField(default=False)
+    times_contacted = models.PositiveIntegerField(default=0)
+    last_contacted_at = models.DateTimeField(null=True, blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    objects = ContactManager()
+
+    class Meta:
+        db_table = "emails_contact"
+        verbose_name = "Contact"
+        verbose_name_plural = "Contacts"
+        ordering = ["-last_contacted_at", "name"]
+        constraints = [
+            models.UniqueConstraint(
+                "mailbox",
+                Lower("email"),
+                name="unique_contact_per_mailbox",
+            )
+        ]
+        indexes = [
+            models.Index(fields=["mailbox", "name"]),
+        ]
+
+    def __str__(self):
+        return f"{self.name} <{self.email}>" if self.name else self.email
+
+    def clean(self):
+        super().clean()
+        if self.email:
+            self.email = self.email.strip().lower()
