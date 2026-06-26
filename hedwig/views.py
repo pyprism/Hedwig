@@ -132,7 +132,14 @@ class UserMailboxAccessViewSet(viewsets.ModelViewSet):
 class EmailThreadViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = EmailThreadSerializer
     filterset_class = EmailThreadFilter
-    ordering_fields = ["last_message_at", "message_count", "created_at"]
+    # folder_last_message_at is only present when ?folder= is applied; it lets a
+    # folder view sort by its own latest message rather than the global one.
+    ordering_fields = [
+        "last_message_at",
+        "message_count",
+        "created_at",
+        "folder_last_message_at",
+    ]
 
     def get_queryset(self):
         return EmailThread.objects.for_api_user(self.request.user).select_related(
