@@ -242,6 +242,27 @@ class EmailRecipientSerializer(serializers.ModelSerializer):
 
 
 class EmailThreadSerializer(serializers.ModelSerializer):
+    # When the list is filtered by ?folder=, the queryset is annotated with
+    # folder-scoped aggregates so each folder reflects only its own messages.
+    # Without a folder filter these fall back to the stored thread totals.
+    message_count = serializers.SerializerMethodField()
+    has_unread = serializers.SerializerMethodField()
+    last_message_at = serializers.SerializerMethodField()
+
+    def get_message_count(self, obj):
+        scoped = getattr(obj, "folder_message_count", None)
+        return scoped if scoped is not None else obj.message_count
+
+    def get_has_unread(self, obj):
+        scoped = getattr(obj, "folder_unread_count", None)
+        if scoped is not None:
+            return scoped > 0
+        return obj.has_unread
+
+    def get_last_message_at(self, obj):
+        scoped = getattr(obj, "folder_last_message_at", None)
+        return scoped if scoped is not None else obj.last_message_at
+
     class Meta:
         model = EmailThread
         fields = [
