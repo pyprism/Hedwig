@@ -7,6 +7,7 @@ from hedwig.models import (
     EmailMessageUserState,
     Mailbox,
 )
+from hedwig.tasks import delete_unreferenced_attachment_file_task
 from utils.enums import DirectionType, EmailStatus, Folder
 
 pytestmark = pytest.mark.django_db
@@ -309,3 +310,147 @@ def test_attachment_download_returns_presigned_url(
         "url": "https://signed.example.com/invoice.pdf",
         "expires_in": 300,
     }
+
+
+def test_permanent_delete_removes_attachment_file_from_s3(
+    api_client,
+    regular_user,
+    mailbox,
+    mailbox_access,
+    monkeypatch,
+    django_capture_on_commit_callbacks,
+):
+    message = EmailMessage.objects.create(
+        mailbox=mailbox,
+        direction=DirectionType.INBOUND,
+        status=EmailStatus.RECEIVED,
+        folder=Folder.TRASH,
+        from_address="customer@example.com",
+        subject="Delete attachment",
+    )
+    attachment = EmailAttachment.objects.create(
+        message=message,
+        filename="invoice.pdf",
+        content_type="application/pdf",
+        size_bytes=12,
+        file="https://files.example.com/email-attachments/invoice.pdf",
+        storage_key="email-attachments/invoice.pdf",
+    )
+    deleted_urls = []
+
+    class DummyUploader:
+        def delete_file(self, url):
+            deleted_urls.append(url)
+            return True
+
+    monkeypatch.setattr("hedwig.tasks.get_s3_uploader", lambda: DummyUploader())
+    api_client.force_authenticate(regular_user)
+
+    with django_capture_on_commit_callbacks(execute=True):
+        response = api_client.delete(
+            f"/api/mail/messages/{message.id}/permanent-delete/"
+        )
+
+    assert response.status_code == 204
+    assert deleted_urls == [attachment.file]
+
+
+def test_permanent_delete_keeps_shared_attachment_file_until_last_reference(
+    api_client,
+    regular_user,
+    mailbox,
+    mailbox_access,
+    monkeypatch,
+    django_capture_on_commit_callbacks,
+):
+    first = EmailMessage.objects.create(
+        mailbox=mailbox,
+        direction=DirectionType.INBOUND,
+        status=EmailStatus.RECEIVED,
+        folder=Folder.TRASH,
+        from_address="customer@example.com",
+        subject="Original",
+    )
+    second = EmailMessage.objects.create(
+        mailbox=mailbox,
+        direction=DirectionType.OUTBOUND,
+        status=EmailStatus.SENT,
+        folder=Folder.SENT,
+        from_address=mailbox.email_address,
+        subject="Forwarded",
+    )
+    file_url = "https://files.example.com/email-attachments/shared.pdf"
+    storage_key = "email-attachments/shared.pdf"
+    EmailAttachment.objects.create(
+        message=first,
+        filename="shared.pdf",
+        content_type="application/pdf",
+        size_bytes=12,
+        file=file_url,
+        storage_key=storage_key,
+    )
+    EmailAttachment.objects.create(
+        message=second,
+        filename="shared.pdf",
+        content_type="application/pdf",
+        size_bytes=12,
+        file=file_url,
+        storage_key=storage_key,
+    )
+    deleted_urls = []
+
+    class DummyUploader:
+        def delete_file(self, url):
+            deleted_urls.append(url)
+            return True
+
+    monkeypatch.setattr("hedwig.tasks.get_s3_uploader", lambda: DummyUploader())
+    api_client.force_authenticate(regular_user)
+
+    with django_capture_on_commit_callbacks(execute=True):
+        response = api_client.delete(f"/api/mail/messages/{first.id}/permanent-delete/")
+
+    assert response.status_code == 204
+    assert deleted_urls == []
+
+    with django_capture_on_commit_callbacks(execute=True):
+        response = api_client.delete(
+            f"/api/mail/messages/{second.id}/permanent-delete/"
+        )
+
+    assert response.status_code == 204
+    assert deleted_urls == [file_url]
+
+
+def test_attachment_file_delete_task_skips_still_referenced_file(mailbox, monkeypatch):
+    message = EmailMessage.objects.create(
+        mailbox=mailbox,
+        direction=DirectionType.INBOUND,
+        status=EmailStatus.RECEIVED,
+        folder=Folder.INBOX,
+        from_address="customer@example.com",
+        subject="Still referenced",
+    )
+    file_url = "https://files.example.com/email-attachments/referenced.pdf"
+    storage_key = "email-attachments/referenced.pdf"
+    EmailAttachment.objects.create(
+        message=message,
+        filename="referenced.pdf",
+        content_type="application/pdf",
+        size_bytes=12,
+        file=file_url,
+        storage_key=storage_key,
+    )
+    deleted_urls = []
+
+    class DummyUploader:
+        def delete_file(self, url):
+            deleted_urls.append(url)
+            return True
+
+    monkeypatch.setattr("hedwig.tasks.get_s3_uploader", lambda: DummyUploader())
+
+    result = delete_unreferenced_attachment_file_task(file_url, storage_key)
+
+    assert result == {"status": "skipped", "reason": "still_referenced"}
+    assert deleted_urls == []
