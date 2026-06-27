@@ -1,8 +1,10 @@
 import base64
 import binascii
 
+from django.db.models import Sum
 from rest_framework import serializers
 
+from hedwig.filters import _search_tokens
 from hedwig.rules import SUPPORTED_ACTIONS, SUPPORTED_CONDITIONS
 from hedwig.models import (
     Contact,
@@ -38,8 +40,33 @@ def normalize_address_rows(rows):
     return normalized
 
 
+def estimate_stored_message_size(message):
+    def address_email(row):
+        if isinstance(row, dict):
+            return row.get("email", "")
+        return str(row or "")
+
+    parts = [
+        message.from_address,
+        message.from_name,
+        message.envelope_sender,
+        message.envelope_recipient,
+        message.reply_to,
+        message.subject,
+        message.body_text,
+        message.body_html,
+        message.snippet,
+    ]
+    parts.extend(address_email(row) for row in message.to_addresses or [])
+    parts.extend(address_email(row) for row in message.cc_addresses or [])
+    parts.extend(address_email(row) for row in message.bcc_addresses or [])
+    parts.extend(f"{key}: {value}" for key, value in message.raw_headers.items())
+    return len("\n".join(part for part in parts if part).encode("utf-8"))
+
+
 class MailboxSerializer(serializers.ModelSerializer):
     email_address = serializers.CharField(read_only=True)
+    used_bytes = serializers.SerializerMethodField()
 
     class Meta:
         model = Mailbox
@@ -74,6 +101,39 @@ class MailboxSerializer(serializers.ModelSerializer):
 
     def validate_local_part(self, value):
         return value.strip().lower()
+
+    def get_used_bytes(self, obj):
+        if obj.used_bytes:
+            return obj.used_bytes
+
+        total = 0
+        messages = obj.messages.only(
+            "size_bytes",
+            "from_address",
+            "from_name",
+            "envelope_sender",
+            "envelope_recipient",
+            "reply_to",
+            "subject",
+            "body_text",
+            "body_html",
+            "snippet",
+            "to_addresses",
+            "cc_addresses",
+            "bcc_addresses",
+            "raw_headers",
+            "has_attachments",
+        )
+        for message in messages.iterator():
+            if message.size_bytes:
+                total += message.size_bytes
+                continue
+            total += estimate_stored_message_size(message)
+            if message.has_attachments:
+                total += (
+                    message.attachments.aggregate(total=Sum("size_bytes"))["total"] or 0
+                )
+        return total
 
 
 class MailboxAliasSerializer(serializers.ModelSerializer):
@@ -248,6 +308,13 @@ class EmailThreadSerializer(serializers.ModelSerializer):
     message_count = serializers.SerializerMethodField()
     has_unread = serializers.SerializerMethodField()
     last_message_at = serializers.SerializerMethodField()
+    unread_count = serializers.SerializerMethodField()
+    snippet = serializers.SerializerMethodField()
+    latest_direction = serializers.SerializerMethodField()
+    has_attachments = serializers.SerializerMethodField()
+    attachment_filenames = serializers.SerializerMethodField()
+    labels = serializers.SerializerMethodField()
+    search_highlight = serializers.SerializerMethodField()
 
     def get_message_count(self, obj):
         scoped = getattr(obj, "folder_message_count", None)
@@ -263,6 +330,82 @@ class EmailThreadSerializer(serializers.ModelSerializer):
         scoped = getattr(obj, "folder_last_message_at", None)
         return scoped if scoped is not None else obj.last_message_at
 
+    def get_unread_count(self, obj):
+        scoped = getattr(obj, "folder_unread_count", None)
+        if scoped is not None:
+            return scoped
+        return obj.messages.filter(is_read=False).count()
+
+    def _latest_message(self, obj):
+        messages = getattr(obj, "prefetched_messages", None)
+        if messages is not None:
+            return messages[0] if messages else None
+        return obj.messages.order_by("-created_at").first()
+
+    def get_snippet(self, obj):
+        message = self._latest_message(obj)
+        return getattr(message, "snippet", "") if message else ""
+
+    def get_latest_direction(self, obj):
+        message = self._latest_message(obj)
+        return getattr(message, "direction", "") if message else ""
+
+    def get_has_attachments(self, obj):
+        messages = getattr(obj, "prefetched_messages", None)
+        if messages is not None:
+            return any(message.has_attachments for message in messages)
+        return obj.messages.filter(has_attachments=True).exists()
+
+    def get_attachment_filenames(self, obj):
+        message = self._latest_message(obj)
+        if not message:
+            return []
+        return list(message.attachments.values_list("filename", flat=True)[:3])
+
+    def get_labels(self, obj):
+        labels = {}
+        messages = getattr(obj, "prefetched_messages", None)
+        queryset = messages if messages is not None else obj.messages.all()
+        for message in queryset:
+            for message_label in message.message_labels.select_related("label").all():
+                label = message_label.label
+                labels[str(label.id)] = {
+                    "id": str(label.id),
+                    "name": label.name,
+                    "color": label.color,
+                }
+        return list(labels.values())
+
+    def get_search_highlight(self, obj):
+        request = self.context.get("request")
+        term = (request.query_params.get("search") if request else "") or ""
+        free_terms = [
+            token.strip('"')
+            for token in _search_tokens(term)
+            if ":" not in token and token.strip('"')
+        ]
+        if not free_terms:
+            return ""
+        message = self._latest_message(obj)
+        haystack = " ".join(
+            filter(
+                None,
+                [
+                    obj.subject,
+                    getattr(message, "snippet", ""),
+                    getattr(message, "body_text", ""),
+                ],
+            )
+        )
+        lower = haystack.lower()
+        for free in free_terms:
+            index = lower.find(free.lower())
+            if index >= 0:
+                start = max(0, index - 40)
+                end = min(len(haystack), index + len(free) + 80)
+                return haystack[start:end].strip()
+        return ""
+
     class Meta:
         model = EmailThread
         fields = [
@@ -274,7 +417,14 @@ class EmailThreadSerializer(serializers.ModelSerializer):
             "participants",
             "message_count",
             "has_unread",
+            "unread_count",
             "last_message_at",
+            "snippet",
+            "latest_direction",
+            "has_attachments",
+            "attachment_filenames",
+            "labels",
+            "search_highlight",
             "created_at",
         ]
         read_only_fields = ["id", "created_at"]
@@ -769,7 +919,11 @@ class SendEmailSerializer(serializers.Serializer):
 class MessageStatePatchSerializer(serializers.Serializer):
     is_read = serializers.BooleanField(required=False)
     is_starred = serializers.BooleanField(required=False)
+    is_important = serializers.BooleanField(required=False)
     folder = serializers.ChoiceField(
         choices=EmailMessage._meta.get_field("folder").choices,
         required=False,
     )
+    archived_at = serializers.DateTimeField(required=False, allow_null=True)
+    snoozed_until = serializers.DateTimeField(required=False, allow_null=True)
+    deleted_at = serializers.DateTimeField(required=False, allow_null=True)
