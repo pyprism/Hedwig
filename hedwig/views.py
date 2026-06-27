@@ -1,5 +1,6 @@
 from django.db import transaction, connections
-from django.db.models import Prefetch
+from django.db.models import Count, FilteredRelation, Prefetch, Q
+from django.db.models.functions import Coalesce
 from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework import (
@@ -142,9 +143,58 @@ class EmailThreadViewSet(viewsets.ReadOnlyModelViewSet):
     ]
 
     def get_queryset(self):
-        return EmailThread.objects.for_api_user(self.request.user).select_related(
-            "mailbox"
+        return (
+            EmailThread.objects.for_api_user(self.request.user)
+            .select_related("mailbox")
+            .prefetch_related(
+                Prefetch(
+                    "messages",
+                    queryset=EmailMessage.objects.for_api_user(self.request.user)
+                    .order_by("-created_at")
+                    .prefetch_related("attachments", "message_labels__label"),
+                    to_attr="prefetched_messages",
+                )
+            )
         )
+
+    @decorators.action(detail=False, methods=["get"], url_path="counts")
+    def counts(self, request):
+        mailbox_id = request.query_params.get("mailbox")
+        messages = EmailMessage.objects.for_api_user(request.user).annotate(
+            _state=FilteredRelation(
+                "user_states",
+                condition=Q(user_states__user=request.user),
+            ),
+            effective_folder=Coalesce("_state__folder", "folder"),
+        )
+        if mailbox_id:
+            messages = messages.filter(mailbox_id=mailbox_id)
+
+        unread = Q(_state__is_read=False) | (
+            Q(_state__pk__isnull=True) & Q(is_read=False)
+        )
+        folder_counts = {
+            row["effective_folder"]: row["unread"]
+            for row in messages.values("effective_folder").annotate(
+                unread=Count("id", filter=unread)
+            )
+        }
+        label_counts = [
+            {
+                "id": str(row["message_labels__label"]),
+                "name": row["message_labels__label__name"],
+                "color": row["message_labels__label__color"],
+                "unread": row["unread"],
+            }
+            for row in messages.filter(message_labels__label__isnull=False)
+            .values(
+                "message_labels__label",
+                "message_labels__label__name",
+                "message_labels__label__color",
+            )
+            .annotate(unread=Count("id", filter=unread, distinct=True))
+        ]
+        return response.Response({"folders": folder_counts, "labels": label_counts})
 
 
 class EmailMessageViewSet(viewsets.ModelViewSet):
@@ -154,7 +204,15 @@ class EmailMessageViewSet(viewsets.ModelViewSet):
     search_fields = ["subject", "from_address", "snippet"]
 
     def get_permissions(self):
-        if self.action in {"send", "state", "cancel", "partial_update", "update"}:
+        if self.action in {
+            "send",
+            "state",
+            "cancel",
+            "restore",
+            "permanent_delete",
+            "partial_update",
+            "update",
+        }:
             return [IsAuthenticated(), MustChangePasswordPermission()]
         if self.action in {"create", "destroy"}:
             return [IsStaffUser()]
@@ -238,13 +296,54 @@ class EmailMessageViewSet(viewsets.ModelViewSet):
 
         return response.Response(self.get_serializer(message).data)
 
+    @decorators.action(detail=True, methods=["post"], url_path="restore")
+    def restore(self, request, pk=None):
+        message = self.get_object()
+        state, _ = EmailMessageUserState.objects.get_or_create(
+            user=request.user,
+            message=message,
+            defaults={
+                "folder": message.folder,
+                "is_read": message.is_read,
+                "is_starred": message.is_starred,
+            },
+        )
+        state.folder = Folder.INBOX
+        state.deleted_at = None
+        state.last_seen_at = timezone.now()
+        state.save(update_fields=["folder", "deleted_at", "last_seen_at", "updated_at"])
+        return response.Response(EmailMessageUserStateSerializer(state).data)
+
+    @decorators.action(detail=True, methods=["delete"], url_path="permanent-delete")
+    def permanent_delete(self, request, pk=None):
+        message = self.get_object()
+        if not (
+            request.user.is_staff
+            or Mailbox.objects.writable_for_user(request.user)
+            .filter(id=message.mailbox_id)
+            .exists()
+        ):
+            raise exceptions.PermissionDenied(
+                "Write access to the mailbox is required."
+            )
+        message.delete()
+        return response.Response(status=status.HTTP_204_NO_CONTENT)
+
     @decorators.action(detail=True, methods=["patch"], url_path="state")
     def state(self, request, pk=None):
         """Update the requesting user's per-mailbox view of a message (read/starred/folder)."""
         message = self.get_object()
         state_data = {
             field: request.data[field]
-            for field in ("is_read", "is_starred", "folder")
+            for field in (
+                "is_read",
+                "is_starred",
+                "is_important",
+                "folder",
+                "archived_at",
+                "snoozed_until",
+                "deleted_at",
+            )
             if field in request.data
         }
         serializer = MessageStatePatchSerializer(data=state_data)
@@ -262,8 +361,11 @@ class EmailMessageViewSet(viewsets.ModelViewSet):
                 is_read=message.is_read,
                 is_starred=message.is_starred,
             )
+        important = values.pop("is_important", None)
         for field, value in values.items():
             setattr(state, field, value)
+        if important is not None:
+            state.metadata = {**(state.metadata or {}), "is_important": important}
         state.last_seen_at = timezone.now()
         state.save()
         return response.Response(EmailMessageUserStateSerializer(state).data)
@@ -302,8 +404,15 @@ class EmailMessageViewSet(viewsets.ModelViewSet):
                     is_read=message.is_read,
                     is_starred=message.is_starred,
                 )
+            important = values.get("is_important")
             for field, value in values.items():
-                setattr(state, field, value)
+                if field != "is_important":
+                    setattr(state, field, value)
+            if important is not None:
+                state.metadata = {
+                    **(state.metadata or {}),
+                    "is_important": important,
+                }
             state.last_seen_at = now
             state.save()
             states.append(state)
