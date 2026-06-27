@@ -54,6 +54,60 @@ def test_mailbox_list_regular_user_sees_only_granted(
     assert ids == {str(mailbox.id)}
 
 
+def test_mailbox_list_estimates_storage_when_cached_usage_is_zero(
+    api_client, regular_user, mailbox, mailbox_access
+):
+    EmailMessage.objects.create(
+        mailbox=mailbox,
+        direction=DirectionType.INBOUND,
+        status=EmailStatus.RECEIVED,
+        folder=Folder.INBOX,
+        from_address="customer@example.com",
+        subject="Usage",
+        body_text="This message should count toward storage.",
+        size_bytes=0,
+    )
+    api_client.force_authenticate(regular_user)
+
+    response = api_client.get("/api/mail/mailboxes/")
+
+    assert response.status_code == 200
+    assert response.data["results"][0]["used_bytes"] > 0
+
+
+def test_thread_counts_respect_user_read_state(
+    api_client, regular_user, mailbox, mailbox_access
+):
+    message = EmailMessage.objects.create(
+        mailbox=mailbox,
+        direction=DirectionType.INBOUND,
+        status=EmailStatus.RECEIVED,
+        folder=Folder.INBOX,
+        from_address="customer@example.com",
+        subject="Unread",
+        body_text="Unread message",
+        is_read=False,
+    )
+    api_client.force_authenticate(regular_user)
+
+    response = api_client.get("/api/mail/threads/counts/", {"mailbox": str(mailbox.id)})
+
+    assert response.status_code == 200
+    assert response.data["folders"]["inbox"] == 1
+
+    EmailMessageUserState.objects.create(
+        user=regular_user,
+        message=message,
+        folder=Folder.INBOX,
+        is_read=True,
+    )
+
+    response = api_client.get("/api/mail/threads/counts/", {"mailbox": str(mailbox.id)})
+
+    assert response.status_code == 200
+    assert response.data["folders"]["inbox"] == 0
+
+
 def test_mailbox_list_regular_user_without_access_sees_nothing(
     api_client, regular_user, mailbox
 ):

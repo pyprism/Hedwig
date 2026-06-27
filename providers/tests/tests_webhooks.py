@@ -57,9 +57,42 @@ def test_inbound_creates_message(
     assert message.mailbox_id == mailbox.id
     assert message.subject == "Help needed"
     assert message.from_address == "customer@external.com"
+    assert message.size_bytes > 0
+    mailbox.refresh_from_db()
+    assert mailbox.used_bytes == message.size_bytes
 
     log = ProviderWebhookLog.objects.get(provider_event_id="inbound:pm-inbound-1")
     assert log.status == "processed"
+
+
+def test_inbound_stores_auth_results_case_insensitively(
+    api_client, authed_domain, mailbox, django_capture_on_commit_callbacks
+):
+    with django_capture_on_commit_callbacks(execute=True):
+        response = _post_webhook(
+            api_client,
+            _inbound_payload(
+                MessageID="pm-inbound-auth",
+                Headers=[
+                    {
+                        "Name": "authentication-results",
+                        "Value": (
+                            "mx.example.com; spf=pass smtp.mailfrom=external.com; "
+                            "dkim=pass header.d=external.com; dmarc=pass"
+                        ),
+                    },
+                    {"Name": "X-Spam-Tests", "Value": "DKIM_VALID,SPF_PASS"},
+                ],
+            ),
+        )
+
+    assert response.status_code == 200
+    message = EmailMessage.objects.get(provider_message_id="pm-inbound-auth")
+    assert message.metadata["auth_results"] == {
+        "spf": "pass",
+        "dkim": "pass",
+        "dmarc": "pass",
+    }
 
 
 def test_inbound_stores_attachments(
