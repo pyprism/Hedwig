@@ -1,9 +1,11 @@
 from celery import shared_task
 from django.core.exceptions import ValidationError
 from django.db import models, transaction
+from django.db.models import Q
 from django.utils import timezone
 
 from hedwig.models import (
+    EmailAttachment,
     EmailMessage,
     Mailbox,
     OutboundSendAttempt,
@@ -12,6 +14,7 @@ from hedwig.models import (
 )
 from providers.postmark import TransientSendError
 from providers.sending import send_with_provider
+from utils.s3 import get_s3_uploader
 from utils.enums import EmailStatus, SendAttemptStatus
 
 
@@ -88,6 +91,24 @@ def mark_attempt_failed(attempt_id, code, message):
 
         attempt.message.status = EmailStatus.FAILED
         attempt.message.save(update_fields=["status", "updated_at"])
+
+
+@shared_task
+def delete_unreferenced_attachment_file_task(file_url, storage_key=None):
+    """Delete an attachment object from S3 after the DB reference is gone."""
+    if not file_url:
+        return {"status": "skipped", "reason": "missing_file_url"}
+
+    lookup = Q(file=file_url)
+    if storage_key:
+        lookup |= Q(storage_key=storage_key)
+    if EmailAttachment.objects.filter(lookup).exists():
+        return {"status": "skipped", "reason": "still_referenced"}
+
+    deleted = get_s3_uploader().delete_file(file_url)
+    if not deleted:
+        return {"status": "failed", "file_url": file_url}
+    return {"status": "deleted", "file_url": file_url}
 
 
 @shared_task
