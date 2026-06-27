@@ -1,5 +1,7 @@
 import django_filters
 from django.db.models import Count, FilteredRelation, Max, Q
+from django.utils.dateparse import parse_date
+from django.utils import timezone
 
 from hedwig.models import (
     Contact,
@@ -72,6 +74,7 @@ class UserMailboxAccessFilter(django_filters.FilterSet):
 class EmailThreadFilter(django_filters.FilterSet):
     subject = django_filters.CharFilter(lookup_expr="icontains")
     folder = django_filters.CharFilter(method="filter_folder")
+    search = django_filters.CharFilter(method="filter_search")
 
     class Meta:
         model = EmailThread
@@ -91,6 +94,7 @@ class EmailThreadFilter(django_filters.FilterSet):
             return queryset
 
         user = getattr(self.request, "user", None)
+        now = timezone.now()
 
         # Per-user state row for each message, scoped to the requesting user.
         # LEFT JOIN, so messages without a state row keep a NULL ``_state``.
@@ -101,9 +105,28 @@ class EmailThreadFilter(django_filters.FilterSet):
             )
         )
 
-        in_folder = Q(_state__folder=value) | (
-            Q(_state__pk__isnull=True) & Q(messages__folder=value)
-        )
+        if value == "starred":
+            in_folder = Q(_state__is_starred=True) | (
+                Q(_state__pk__isnull=True) & Q(messages__is_starred=True)
+            )
+        elif value == "important":
+            in_folder = (
+                Q(_state__metadata__is_important=True)
+                | Q(messages__metadata__is_important=True)
+                | Q(messages__metadata__importance__iexact="high")
+                | Q(messages__raw_headers__Importance__iexact="high")
+                | Q(**{"messages__raw_headers__X-Priority__startswith": "1"})
+            )
+        elif value == "snoozed":
+            in_folder = Q(_state__snoozed_until__gt=now)
+        else:
+            in_folder = Q(_state__folder=value) | (
+                Q(_state__pk__isnull=True) & Q(messages__folder=value)
+            )
+            if value == "inbox":
+                in_folder &= Q(_state__snoozed_until__isnull=True) | Q(
+                    _state__snoozed_until__lte=now
+                )
         unread_in_folder = in_folder & (
             Q(_state__is_read=False)
             | (Q(_state__pk__isnull=True) & Q(messages__is_read=False))
@@ -122,6 +145,95 @@ class EmailThreadFilter(django_filters.FilterSet):
             # still overrides this when ?ordering= is supplied.
             .order_by("-folder_last_message_at")
         )
+
+    def filter_search(self, queryset, name, value):
+        term = (value or "").strip()
+        if not term:
+            return queryset
+        query = Q()
+        free_terms = []
+        for token in _search_tokens(term):
+            key, sep, raw = token.partition(":")
+            value = raw.strip('"') if sep else token.strip('"')
+            if not sep:
+                free_terms.append(value)
+            elif key == "from":
+                query &= Q(messages__from_address__icontains=value)
+            elif key == "to":
+                query &= Q(messages__to_addresses__icontains=value)
+            elif key == "cc":
+                query &= Q(messages__cc_addresses__icontains=value)
+            elif key == "bcc":
+                query &= Q(messages__bcc_addresses__icontains=value)
+            elif key == "subject":
+                query &= Q(messages__subject__icontains=value) | Q(
+                    subject__icontains=value
+                )
+            elif key == "label":
+                query &= Q(messages__message_labels__label__name__icontains=value)
+            elif key == "filename":
+                query &= Q(messages__attachments__filename__icontains=value)
+            elif key == "has" and value == "attachment":
+                query &= Q(messages__has_attachments=True)
+            elif key == "is" and value == "unread":
+                query &= Q(has_unread=True) | Q(messages__is_read=False)
+            elif key == "is" and value == "starred":
+                query &= Q(messages__is_starred=True) | Q(
+                    messages__user_states__is_starred=True
+                )
+            elif key == "is" and value == "important":
+                query &= (
+                    Q(messages__metadata__is_important=True)
+                    | Q(messages__metadata__importance__iexact="high")
+                    | Q(messages__user_states__metadata__is_important=True)
+                )
+            elif key == "after":
+                date = parse_date(value)
+                if date:
+                    query &= Q(messages__created_at__date__gte=date)
+            elif key == "before":
+                date = parse_date(value)
+                if date:
+                    query &= Q(messages__created_at__date__lte=date)
+            elif key == "in":
+                query &= Q(messages__folder=value)
+            else:
+                free_terms.append(token)
+
+        for free in free_terms:
+            query &= (
+                Q(subject__icontains=free)
+                | Q(participants__icontains=free)
+                | Q(messages__subject__icontains=free)
+                | Q(messages__snippet__icontains=free)
+                | Q(messages__body_text__icontains=free)
+                | Q(messages__from_address__icontains=free)
+                | Q(messages__to_addresses__icontains=free)
+                | Q(messages__cc_addresses__icontains=free)
+                | Q(messages__bcc_addresses__icontains=free)
+                | Q(messages__attachments__filename__icontains=free)
+                | Q(messages__message_labels__label__name__icontains=free)
+            )
+        return queryset.filter(query).distinct()
+
+
+def _search_tokens(query):
+    tokens = []
+    current = []
+    in_quotes = False
+    for char in query:
+        if char == '"':
+            in_quotes = not in_quotes
+            current.append(char)
+        elif char.isspace() and not in_quotes:
+            if current:
+                tokens.append("".join(current))
+                current = []
+        else:
+            current.append(char)
+    if current:
+        tokens.append("".join(current))
+    return tokens
 
 
 class EmailMessageFilter(django_filters.FilterSet):
