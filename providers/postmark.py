@@ -107,15 +107,31 @@ def parse_postmark_date(value):
     return parsed
 
 
-AUTH_RESULT_PATTERN = re.compile(r"(spf|dkim|dmarc)=(\w+)", re.IGNORECASE)
+AUTH_RESULT_PATTERN = re.compile(r"\b(spf|dkim|dmarc)=([a-zA-Z0-9_-]+)", re.IGNORECASE)
+
+
+def header_value(headers, name):
+    """Return a header value without depending on provider casing."""
+    normalized = name.lower()
+    for key, value in (headers or {}).items():
+        if str(key).lower() == normalized:
+            return value or ""
+    return ""
 
 
 def parse_auth_results(headers):
     """Extract spf/dkim/dmarc verdicts from an Authentication-Results header."""
-    raw = headers.get("Authentication-Results") or ""
+    raw = header_value(headers, "Authentication-Results")
     results = {}
     for key, value in AUTH_RESULT_PATTERN.findall(raw):
         results[key.lower()] = value.lower()
+    spam_tests = header_value(headers, "X-Spam-Tests").upper()
+    if "DKIM_VALID" in spam_tests:
+        results.setdefault("dkim", "pass")
+    if "SPF_PASS" in spam_tests:
+        results.setdefault("spf", "pass")
+    if "SPF_FAIL" in spam_tests:
+        results.setdefault("spf", "fail")
     return results
 
 
