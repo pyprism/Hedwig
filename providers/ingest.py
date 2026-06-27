@@ -46,6 +46,28 @@ class MailboxQuotaExceeded(Exception):
     """Raised when an inbound message would push a mailbox over its storage quota."""
 
 
+def estimate_inbound_message_size(normalized):
+    """Fallback byte estimate when a provider does not include MessageSize."""
+    parts = [
+        normalized.from_address,
+        normalized.from_name,
+        normalized.envelope_sender,
+        normalized.envelope_recipient,
+        normalized.reply_to,
+        normalized.subject,
+        normalized.body_text,
+        normalized.body_html,
+        normalized.rfc_message_id or "",
+        normalized.in_reply_to or "",
+        normalized.references or "",
+    ]
+    parts.extend(row.email for row in normalized.to)
+    parts.extend(row.email for row in normalized.cc)
+    parts.extend(row.email for row in normalized.bcc)
+    parts.extend(f"{key}: {value}" for key, value in normalized.raw_headers.items())
+    return len("\n".join(part for part in parts if part).encode("utf-8"))
+
+
 def normalize_subject(subject):
     subject = (subject or "").strip()
     while True:
@@ -195,7 +217,10 @@ def create_inbound_message(provider, mailbox, recipient_email, normalized, raw_w
         else Folder.INBOX
     )
 
-    incoming_size = normalized.size_bytes + sum(
+    stored_message_size = normalized.size_bytes or estimate_inbound_message_size(
+        normalized
+    )
+    incoming_size = stored_message_size + sum(
         attachment.declared_size for attachment in normalized.attachments
     )
     if mailbox.quota_bytes and mailbox.used_bytes + incoming_size > mailbox.quota_bytes:
@@ -234,7 +259,7 @@ def create_inbound_message(provider, mailbox, recipient_email, normalized, raw_w
             raw_headers=normalized.raw_headers,
             provider=provider,
             provider_message_id=normalized.provider_message_id,
-            size_bytes=normalized.size_bytes,
+            size_bytes=stored_message_size,
             spam_score=normalized.spam_score,
             metadata={**normalized.metadata, "auth_results": normalized.auth_results},
             received_at=normalized.received_at,
@@ -260,7 +285,7 @@ def create_inbound_message(provider, mailbox, recipient_email, normalized, raw_w
                 ]
             )
 
-        total_size = normalized.size_bytes
+        total_size = stored_message_size
         for attachment in normalized.attachments:
             file_url, storage_key, checksum, size_bytes = store_attachment_content(
                 mailbox.id, attachment.filename, attachment.content_b64
