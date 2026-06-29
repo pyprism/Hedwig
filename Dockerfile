@@ -52,4 +52,4 @@ RUN mkdir -p /app/staticfiles && chown hedwig:hedwig /app/staticfiles
 
 USER hedwig
 
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["/app/entrypoint.sh"]
