@@ -683,6 +683,7 @@ class EmailMessageUserState(models.Model):
     )
     is_read = models.BooleanField(default=False, db_index=True)
     is_starred = models.BooleanField(default=False)
+    is_important = models.BooleanField(default=False, db_index=True)
     archived_at = models.DateTimeField(null=True, blank=True)
     snoozed_until = models.DateTimeField(null=True, blank=True)
     deleted_at = models.DateTimeField(null=True, blank=True)
