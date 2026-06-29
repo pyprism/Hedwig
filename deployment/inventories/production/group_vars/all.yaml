@@ -1,0 +1,20 @@
+# Common variables for all hosts
+
+# Project settings
+project_name: hedwig
+# Hedwig is a public repo — clone over HTTPS, no deploy key needed.
+# For a private fork use the SSH URL (git@github.com:pyprism/Hedwig.git) and
+# provide git_ssh_private_key in vars/secrets.yaml (see secrets.yaml.example).
+project_repo: https://github.com/pyprism/Hedwig.git
+project_branch: master
+
+# Deployment paths (base path comes from vars/secrets.yaml)
+# deployment_base_dir is defined in vars/secrets.yaml (default: /opt/hedwig)
+project_root: "{{ deployment_base_dir }}"
+logs_dir: "{{ deployment_base_dir }}/logs"
+
+# Django settings module
+django_settings_module: "hiren.settings"
+
+# Git settings
+use_git_agent_forwarding: false  # Set to true if cloning a private fork via SSH agent forwarding
