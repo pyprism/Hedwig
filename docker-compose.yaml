@@ -59,6 +59,9 @@ services:
     container_name: hedwig_api
     restart: unless-stopped
 
+    # uWSGI launcher (auto-detects CPUs, then exec uwsgi)
+    entrypoint: ["/app/entrypoint.sh"]
+
     env_file: .env                # loads secret_key, db_*, allowed_hosts, etc.
     environment:
       # Override db_host so Django talks to the Linux host's PostgreSQL.

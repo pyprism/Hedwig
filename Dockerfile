@@ -51,5 +51,3 @@ RUN mkdir -p /app/logs /app/run && chown hedwig:hedwig /app /app/logs /app/run
 RUN mkdir -p /app/staticfiles && chown hedwig:hedwig /app/staticfiles
 
 USER hedwig
-
-ENTRYPOINT ["/app/entrypoint.sh"]
