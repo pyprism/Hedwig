@@ -519,6 +519,7 @@ class EmailMessageUserStateSerializer(serializers.ModelSerializer):
             "folder",
             "is_read",
             "is_starred",
+            "is_important",
             "archived_at",
             "snoozed_until",
             "deleted_at",
@@ -914,6 +915,118 @@ class SendEmailSerializer(serializers.Serializer):
         )
         message._send_attempt = attempt
         return message
+
+
+class DraftEmailSerializer(SendEmailSerializer):
+    """Create or update an unsent draft.
+
+    Reuses the send serializer's field set and validation helpers but relaxes
+    the rules that only matter for an actual send: recipients and body may be
+    empty, and suppressed recipients are not rejected (nothing is delivered).
+    """
+
+    to = serializers.ListField(child=serializers.JSONField(), required=False)
+    to_addresses = serializers.ListField(
+        child=serializers.JSONField(),
+        required=False,
+        write_only=True,
+    )
+
+    def validate(self, attrs):
+        attrs["to"] = normalize_address_rows(self._recipient_rows(attrs, "to") or [])
+        attrs["cc"] = normalize_address_rows(self._recipient_rows(attrs, "cc") or [])
+        attrs["bcc"] = normalize_address_rows(self._recipient_rows(attrs, "bcc") or [])
+
+        mailbox = attrs.get("mailbox") or getattr(self.instance, "mailbox", None)
+        if mailbox is None:
+            raise serializers.ValidationError({"mailbox": ["This field is required."]})
+
+        sender_identity = attrs.get("sender_identity")
+        if sender_identity and sender_identity.mailbox_id != mailbox.id:
+            raise serializers.ValidationError("Sender identity must belong to mailbox.")
+
+        thread = attrs.get("thread")
+        if thread is not None and thread.mailbox_id != mailbox.id:
+            raise serializers.ValidationError(
+                {"thread": ["Thread must belong to mailbox."]}
+            )
+
+        reply_to_message = attrs.pop("reply_to_message", None)
+        if reply_to_message is not None:
+            if reply_to_message.mailbox_id != mailbox.id:
+                raise serializers.ValidationError(
+                    {"reply_to_message": ["Message must belong to mailbox."]}
+                )
+            attrs.setdefault("thread", reply_to_message.thread)
+
+        if "attachments" in attrs:
+            attrs["attachments"] = self._validate_draft_attachments(
+                attrs.get("attachments") or []
+            )
+        return attrs
+
+    def _validate_draft_attachments(self, attachments):
+        """Like ``_validate_attachments`` but each item may instead be a
+        reference (``{"id": ...}``) to an already-staged attachment to keep."""
+        references = []
+        new_items = []
+        for item in attachments:
+            if isinstance(item, dict) and item.get("id"):
+                references.append({"id": str(item["id"])})
+            else:
+                new_items.append(item)
+        # Reuse the strict send validation (count/size/base64) for the new ones.
+        validated_new = self._validate_attachments(new_items)
+        if len(references) + len(validated_new) > self.MAX_ATTACHMENTS:
+            raise serializers.ValidationError(
+                {
+                    "attachments": [
+                        f"At most {self.MAX_ATTACHMENTS} attachments are allowed."
+                    ]
+                }
+            )
+        return references + validated_new
+
+    def create(self, validated_data):
+        return EmailMessage.objects.create_draft_message(
+            mailbox=validated_data["mailbox"],
+            created_by=self.context["request"].user,
+            sender_identity=validated_data.get("sender_identity"),
+            to_addresses=validated_data.get("to", []),
+            cc_addresses=validated_data.get("cc", []),
+            bcc_addresses=validated_data.get("bcc", []),
+            subject=validated_data.get("subject", ""),
+            body_text=validated_data.get("body_text", ""),
+            body_html=validated_data.get("body_html", ""),
+            reply_to=validated_data.get("reply_to", ""),
+            metadata=validated_data.get("metadata", {}),
+            scheduled_at=validated_data.get("scheduled_at"),
+            attachments=validated_data.get("attachments", []),
+            thread=validated_data.get("thread"),
+        )
+
+    def update(self, instance, validated_data):
+        # Map only the fields the caller actually supplied onto the manager's
+        # partial-update kwargs (the manager sentinel leaves the rest untouched).
+        passthrough = {
+            "sender_identity": "sender_identity",
+            "subject": "subject",
+            "body_text": "body_text",
+            "body_html": "body_html",
+            "reply_to": "reply_to",
+            "metadata": "metadata",
+            "scheduled_at": "scheduled_at",
+            "attachments": "attachments",
+        }
+        kwargs = {
+            arg: validated_data[key]
+            for key, arg in passthrough.items()
+            if key in validated_data
+        }
+        for key in ("to", "cc", "bcc"):
+            if key in validated_data:
+                kwargs[f"{key}_addresses"] = validated_data[key]
+        return EmailMessage.objects.update_draft_message(instance, **kwargs)
 
 
 class MessageStatePatchSerializer(serializers.Serializer):
