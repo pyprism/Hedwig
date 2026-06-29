@@ -297,7 +297,7 @@ REST_FRAMEWORK = {
     ),
     "DEFAULT_THROTTLE_RATES": {
         "anon": "60/minute",
-        "user": "40/minute",
+        "user": "150/minute",
         "provider-webhook": "120/minute",
     },
     "DEFAULT_PARSER_CLASSES": (
