@@ -52,5 +52,4 @@ RUN mkdir -p /app/staticfiles && chown hedwig:hedwig /app/staticfiles
 
 USER hedwig
 
-# uWSGI serves on TCP 0.0.0.0:8000; override CMD for management commands
-CMD ["uwsgi", "--enable-threads", "--ini", "hedwig.ini"]
+ENTRYPOINT ["/entrypoint.sh"]
