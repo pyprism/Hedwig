@@ -6,6 +6,8 @@ working out of the same mailbox. Hedwig manages mailboxes and domains,
 ingests inbound mail and sends outbound mail through pluggable email providers
 (currently Postmark), and tracks delivery events via webhooks.
 
+This codebase contains only backend, for cross-platform client [Hedwig-Client](https://github.com/pyprism/Hedwig-Client)
+
 ## Requirement
 
 - PostgreSQL && Rabbitmq
