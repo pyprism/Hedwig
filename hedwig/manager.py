@@ -14,6 +14,10 @@ from utils.enums import (
     SendAttemptStatus,
 )
 
+# Sentinel distinguishing "field omitted" from "field explicitly set to None"
+# in partial draft updates.
+_UNSET = object()
+
 
 def active_access_filter(prefix=""):
     expires_field = f"{prefix}expires_at"
@@ -260,37 +264,268 @@ class EmailMessageManager(models.Manager.from_queryset(EmailMessageQuerySet)):
                 Contact.objects.record_contact(
                     mailbox, row["email"], row.get("name", "")
                 )
-            if attachments:
-                total_size = 0
-                for attachment in attachments:
-                    filename = attachment.get("filename") or "attachment"
-                    content_type = (
-                        attachment.get("content_type") or "application/octet-stream"
-                    )
-                    content_b64 = attachment.get("content")
-                    try:
-                        size_bytes = (
-                            len(base64.b64decode(content_b64)) if content_b64 else 0
+            self._stage_attachments(message, attachments)
+            attempt = OutboundSendAttempt.objects.create(
+                message=message,
+                provider=provider,
+                attempt_number=1,
+                status=SendAttemptStatus.PENDING,
+                idempotency_key=uuid.uuid4().hex[:16],
+                request_payload={},
+            )
+        return message, attempt
+
+    def create_draft_message(
+        self,
+        *,
+        mailbox,
+        created_by,
+        sender_identity=None,
+        to_addresses=None,
+        cc_addresses=None,
+        bcc_addresses=None,
+        subject="",
+        body_text="",
+        body_html="",
+        reply_to="",
+        metadata=None,
+        scheduled_at=None,
+        attachments=None,
+        thread=None,
+    ):
+        """Persist an unsent draft (no recipient rows, no send attempt).
+
+        Each draft gets its own dedicated ``EmailThread`` so it is visible (and
+        therefore editable/sendable) across the author's devices via the
+        folder-aware threads endpoint. No contacts are recorded — the draft only
+        materialises recipients/contacts once actually sent.
+        """
+        from hedwig.models import EmailThread
+        from providers.ingest import normalize_subject
+
+        metadata = metadata or {}
+        attachments = attachments or []
+        to_addresses = to_addresses or []
+        cc_addresses = cc_addresses or []
+        bcc_addresses = bcc_addresses or []
+
+        sender_email = (
+            sender_identity.email if sender_identity else mailbox.email_address
+        )
+        sender_name = (
+            sender_identity.display_name
+            if sender_identity and sender_identity.display_name
+            else mailbox.display_name
+        )
+        provider = mailbox.domain.provider
+        snippet = (body_text or "").strip().replace("\n", " ")[:500]
+        now = timezone.now()
+        participants = sorted(
+            {sender_email}
+            | {
+                row["email"]
+                for row in to_addresses + cc_addresses + bcc_addresses
+                if row.get("email")
+            }
+        )
+
+        with transaction.atomic():
+            if thread is None:
+                thread = EmailThread.objects.create(
+                    mailbox=mailbox,
+                    subject=subject,
+                    normalized_subject=normalize_subject(subject),
+                    root_message_id="",
+                    participants=participants,
+                    message_count=1,
+                    has_unread=False,
+                    last_message_at=now,
+                )
+            message = self.create(
+                mailbox=mailbox,
+                thread=thread,
+                sender_identity=sender_identity,
+                created_by=created_by,
+                direction=DirectionType.OUTBOUND,
+                status=EmailStatus.DRAFT,
+                folder=Folder.DRAFTS,
+                rfc_message_id="",
+                from_address=sender_email,
+                from_name=sender_name,
+                to_addresses=to_addresses or [],
+                cc_addresses=cc_addresses or [],
+                bcc_addresses=bcc_addresses or [],
+                reply_to=reply_to,
+                subject=subject,
+                body_text=body_text,
+                body_html=body_html,
+                snippet=snippet,
+                provider=provider,
+                is_read=True,
+                metadata=metadata,
+                scheduled_at=scheduled_at,
+            )
+            self._stage_attachments(message, attachments)
+        return message
+
+    def update_draft_message(
+        self,
+        message,
+        *,
+        sender_identity=_UNSET,
+        to_addresses=_UNSET,
+        cc_addresses=_UNSET,
+        bcc_addresses=_UNSET,
+        subject=_UNSET,
+        body_text=_UNSET,
+        body_html=_UNSET,
+        reply_to=_UNSET,
+        metadata=_UNSET,
+        scheduled_at=_UNSET,
+        attachments=_UNSET,
+    ):
+        """Update an existing draft in place. Only provided fields change.
+
+        When ``attachments`` is given it is the complete desired set, where each
+        item is either a reference to an already-staged attachment (``{"id":
+        ...}``) to keep, or a new base64 attachment to add. Staged attachments
+        not referenced are dropped. This lets a device that loaded the draft
+        from the server (and so lacks the original base64) keep those
+        attachments by id while still adding its own.
+        """
+        fields = []
+        if sender_identity is not _UNSET:
+            message.sender_identity = sender_identity
+            message.from_address = (
+                sender_identity.email
+                if sender_identity
+                else message.mailbox.email_address
+            )
+            message.from_name = (
+                sender_identity.display_name
+                if sender_identity and sender_identity.display_name
+                else message.mailbox.display_name
+            )
+            fields += ["sender_identity", "from_address", "from_name"]
+        if to_addresses is not _UNSET:
+            message.to_addresses = to_addresses or []
+            fields.append("to_addresses")
+        if cc_addresses is not _UNSET:
+            message.cc_addresses = cc_addresses or []
+            fields.append("cc_addresses")
+        if bcc_addresses is not _UNSET:
+            message.bcc_addresses = bcc_addresses or []
+            fields.append("bcc_addresses")
+        if subject is not _UNSET:
+            message.subject = subject
+            fields.append("subject")
+        if reply_to is not _UNSET:
+            message.reply_to = reply_to
+            fields.append("reply_to")
+        if metadata is not _UNSET:
+            message.metadata = metadata or {}
+            fields.append("metadata")
+        if scheduled_at is not _UNSET:
+            message.scheduled_at = scheduled_at
+            fields.append("scheduled_at")
+        if body_text is not _UNSET:
+            message.body_text = body_text
+            message.snippet = (body_text or "").strip().replace("\n", " ")[:500]
+            fields += ["body_text", "snippet"]
+        if body_html is not _UNSET:
+            message.body_html = body_html
+            fields.append("body_html")
+
+        with transaction.atomic():
+            if attachments is not _UNSET:
+                self._reconcile_draft_attachments(message, attachments or [])
+                fields += ["has_attachments", "size_bytes"]
+            if fields:
+                fields.append("updated_at")
+                message.save(update_fields=fields)
+        message.refresh_from_db()
+        return message
+
+    def _reconcile_draft_attachments(self, message, attachments):
+        """Apply the desired attachment set to a draft: keep referenced
+        (``{"id": ...}``) staged rows, add new base64 ones, drop the rest."""
+        keep_ids = {
+            str(item["id"])
+            for item in attachments
+            if isinstance(item, dict) and item.get("id")
+        }
+        new_items = [
+            item
+            for item in attachments
+            if isinstance(item, dict) and not item.get("id")
+        ]
+        message.attachments.exclude(id__in=keep_ids).delete()
+        # Recompute size from the survivors before staging the new ones, which
+        # add their own bytes to message.size_bytes via _stage_attachments.
+        kept = list(message.attachments.all())
+        message.has_attachments = bool(kept)
+        message.size_bytes = sum(a.size_bytes for a in kept)
+        message.save(update_fields=["has_attachments", "size_bytes"])
+        self._stage_attachments(message, new_items)
+
+    def promote_draft_to_send(self, message):
+        """Turn an existing draft into a queued outbound send in place, reusing
+        its already-staged attachments. Returns ``(message, attempt)``.
+
+        Used to send a draft from any device — including one that loaded it from
+        the server and so lacks the original attachment bytes, since those stay
+        staged on the existing ``EmailAttachment`` rows.
+        """
+        from hedwig.models import (
+            Contact,
+            EmailRecipient,
+            OutboundSendAttempt,
+        )
+
+        to_addresses = message.to_addresses or []
+        cc_addresses = message.cc_addresses or []
+        bcc_addresses = message.bcc_addresses or []
+        provider = message.mailbox.domain.provider
+
+        with transaction.atomic():
+            if not message.rfc_message_id:
+                message.rfc_message_id = (
+                    f"<{uuid.uuid4()}@{message.mailbox.domain.name}>"
+                )
+            message.status = EmailStatus.QUEUED
+            message.folder = Folder.SENT
+            message.is_read = True
+            message.provider = provider
+            message.save(
+                update_fields=[
+                    "rfc_message_id",
+                    "status",
+                    "folder",
+                    "is_read",
+                    "provider",
+                    "updated_at",
+                ]
+            )
+            # Recipient rows aren't created for drafts, so create them now.
+            for recipient_type, rows in (
+                (RecipientType.TO, to_addresses),
+                (RecipientType.CC, cc_addresses),
+                (RecipientType.BCC, bcc_addresses),
+            ):
+                EmailRecipient.objects.bulk_create(
+                    [
+                        EmailRecipient(
+                            message=message,
+                            recipient_type=recipient_type,
+                            email=row["email"],
+                            name=row.get("name", ""),
                         )
-                    except (binascii.Error, ValueError):
-                        size_bytes = 0
-                    total_size += size_bytes
-                    EmailAttachment.objects.create(
-                        message=message,
-                        filename=filename,
-                        content_type=content_type,
-                        size_bytes=size_bytes,
-                        content_id=attachment.get("content_id") or None,
-                        is_inline=bool(attachment.get("content_id")),
-                        metadata={
-                            "source": "outbound_compose",
-                            "pending_content_b64": content_b64,
-                        },
-                    )
-                message.has_attachments = True
-                message.size_bytes = total_size
-                message.save(
-                    update_fields=["has_attachments", "size_bytes", "updated_at"]
+                        for row in rows
+                    ]
+                )
+            for row in to_addresses + cc_addresses + bcc_addresses:
+                Contact.objects.record_contact(
+                    message.mailbox, row["email"], row.get("name", "")
                 )
             attempt = OutboundSendAttempt.objects.create(
                 message=message,
@@ -301,6 +536,41 @@ class EmailMessageManager(models.Manager.from_queryset(EmailMessageQuerySet)):
                 request_payload={},
             )
         return message, attempt
+
+    def _stage_attachments(self, message, attachments):
+        """Persist base64 attachments as EmailAttachment rows with the raw
+        bytes staged in ``metadata.pending_content_b64`` for the send task."""
+        from hedwig.models import EmailAttachment
+
+        if not attachments:
+            return
+        total_size = 0
+        for attachment in attachments:
+            filename = attachment.get("filename") or "attachment"
+            content_type = attachment.get("content_type") or "application/octet-stream"
+            content_b64 = attachment.get("content")
+            try:
+                size_bytes = len(base64.b64decode(content_b64)) if content_b64 else 0
+            except (binascii.Error, ValueError):
+                size_bytes = 0
+            total_size += size_bytes
+            EmailAttachment.objects.create(
+                message=message,
+                filename=filename,
+                content_type=content_type,
+                size_bytes=size_bytes,
+                content_id=attachment.get("content_id") or None,
+                is_inline=bool(attachment.get("content_id")),
+                metadata={
+                    "source": "outbound_compose",
+                    "pending_content_b64": content_b64,
+                },
+            )
+        # Increment (not overwrite) so this can append to attachments kept from
+        # a prior reconcile; on a fresh message size_bytes starts at 0.
+        message.has_attachments = True
+        message.size_bytes = (message.size_bytes or 0) + total_size
+        message.save(update_fields=["has_attachments", "size_bytes", "updated_at"])
 
 
 class EmailRecipientQuerySet(models.QuerySet):
