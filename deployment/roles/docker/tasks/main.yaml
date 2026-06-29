@@ -35,6 +35,14 @@
     groups: docker
     append: yes
 
+# Adding the deployment user to the docker group will not take effect in the current active Ansible SSH session due
+# to connection reuse (especially with pipelining = True enabled in ansible.cfg). As a result, subsequent tasks running
+# as deployment_user (such as docker compose up) will fail with permission denied when trying to access the Docker
+# socket. Use meta: reset_connection immediately after the group assignment to force Ansible to reconnect and pick up
+#  the new group membership.
+- name: Reset connection to apply group changes
+  meta: reset_connection
+
 - name: Verify Docker daemon is running
   command: docker info
   register: docker_info
@@ -118,7 +126,6 @@
     owner: "{{ deployment_user }}"
     group: "{{ deployment_user }}"
     mode: '0600'
-  notify: restart hedwig containers
 
 - name: Ensure logs directory exists
   file:
@@ -170,7 +177,7 @@
             print(state)
     ")
     echo "$status"
-    echo "$status" | grep -qi "healthy"
+    echo "$status" | grep -wiq "healthy"
   become: yes
   become_user: "{{ deployment_user }}"
   register: compose_health
