@@ -111,7 +111,7 @@ class EmailThreadFilter(django_filters.FilterSet):
             )
         elif value == "important":
             in_folder = (
-                Q(_state__metadata__is_important=True)
+                Q(_state__is_important=True)
                 | Q(messages__metadata__is_important=True)
                 | Q(messages__metadata__importance__iexact="high")
                 | Q(messages__raw_headers__Importance__iexact="high")
@@ -185,7 +185,7 @@ class EmailThreadFilter(django_filters.FilterSet):
                 query &= (
                     Q(messages__metadata__is_important=True)
                     | Q(messages__metadata__importance__iexact="high")
-                    | Q(messages__user_states__metadata__is_important=True)
+                    | Q(messages__user_states__is_important=True)
                 )
             elif key == "after":
                 date = parse_date(value)
@@ -282,7 +282,7 @@ class EmailRecipientFilter(django_filters.FilterSet):
 class EmailMessageUserStateFilter(django_filters.FilterSet):
     class Meta:
         model = EmailMessageUserState
-        fields = ["user", "message", "folder", "is_read", "is_starred"]
+        fields = ["user", "message", "folder", "is_read", "is_starred", "is_important"]
 
 
 class OutboundSendAttemptFilter(django_filters.FilterSet):
