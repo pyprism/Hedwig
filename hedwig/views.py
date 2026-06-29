@@ -59,6 +59,7 @@ from hedwig.serializers import (
     EmailThreadSerializer,
     MailboxAliasSerializer,
     MailboxRuleSerializer,
+    DraftEmailSerializer,
     MailboxSerializer,
     MessageStatePatchSerializer,
     OutboundSendAttemptSerializer,
@@ -212,9 +213,15 @@ class EmailMessageViewSet(viewsets.ModelViewSet):
             "permanent_delete",
             "partial_update",
             "update",
+            "draft",
+            "draft_update",
+            "send_draft",
+            # destroy is gated inside destroy(): owners may delete their own
+            # drafts, everything else stays staff-only.
+            "destroy",
         }:
             return [IsAuthenticated(), MustChangePasswordPermission()]
-        if self.action in {"create", "destroy"}:
+        if self.action == "create":
             return [IsStaffUser()]
         return [IsAuthenticated(), MustChangePasswordPermission()]
 
@@ -270,6 +277,84 @@ class EmailMessageViewSet(viewsets.ModelViewSet):
         transaction.on_commit(enqueue_send)
         output = self.get_serializer(message)
         return response.Response(output.data, status=status.HTTP_202_ACCEPTED)
+
+    @decorators.action(detail=False, methods=["post"], url_path="draft")
+    def draft(self, request):
+        """Create an unsent draft (status=draft, folder=drafts)."""
+        serializer = DraftEmailSerializer(
+            data=request.data,
+            context=self.get_serializer_context(),
+        )
+        serializer.is_valid(raise_exception=True)
+        message = serializer.save()
+        return response.Response(
+            self.get_serializer(message).data, status=status.HTTP_201_CREATED
+        )
+
+    @decorators.action(detail=True, methods=["patch"], url_path="draft")
+    def draft_update(self, request, pk=None):
+        """Update the requesting user's own draft in place."""
+        message = self._get_editable_draft()
+        serializer = DraftEmailSerializer(
+            message,
+            data=request.data,
+            partial=True,
+            context=self.get_serializer_context(),
+        )
+        serializer.is_valid(raise_exception=True)
+        message = serializer.save()
+        return response.Response(self.get_serializer(message).data)
+
+    @decorators.action(detail=True, methods=["post"], url_path="send-draft")
+    def send_draft(self, request, pk=None):
+        """Promote the requesting user's own draft into a queued send, reusing
+        its already-staged attachments. Sending works from any device."""
+        message = self._get_editable_draft()
+        if not (message.to_addresses or []):
+            raise exceptions.ValidationError({"to": ["This field is required."]})
+        if not (message.body_text or message.body_html):
+            raise exceptions.ValidationError("Provide body_text or body_html.")
+
+        message, attempt = EmailMessage.objects.promote_draft_to_send(message)
+
+        def enqueue_send():
+            options = {}
+            if message.scheduled_at:
+                options["eta"] = message.scheduled_at
+            send_email_message_task.apply_async(
+                args=[str(message.id), str(attempt.id)],
+                **options,
+            )
+
+        transaction.on_commit(enqueue_send)
+        return response.Response(
+            self.get_serializer(message).data, status=status.HTTP_202_ACCEPTED
+        )
+
+    def destroy(self, request, *args, **kwargs):
+        # Staff keep full delete; regular users may only delete their own draft.
+        if not request.user.is_staff:
+            self._get_editable_draft()
+        return super().destroy(request, *args, **kwargs)
+
+    def _get_editable_draft(self):
+        """Resolve the target message and ensure it is a draft the requesting
+        user authored in a mailbox they can write to."""
+        message = self.get_object()
+        if message.status != EmailStatus.DRAFT:
+            raise exceptions.PermissionDenied("Only drafts can be edited or deleted.")
+        if message.created_by_id != self.request.user.id:
+            raise exceptions.PermissionDenied("You can only modify your own drafts.")
+        if (
+            not self.request.user.is_staff
+            and not Mailbox.objects.writable_for_user(self.request.user)
+            .filter(id=message.mailbox_id)
+            .exists()
+        ):
+            raise exceptions.PermissionDenied(
+                "Write access to the mailbox is required."
+            )
+        return message
 
     @decorators.action(detail=True, methods=["post"], url_path="cancel")
     def cancel(self, request, pk=None):
@@ -361,11 +446,8 @@ class EmailMessageViewSet(viewsets.ModelViewSet):
                 is_read=message.is_read,
                 is_starred=message.is_starred,
             )
-        important = values.pop("is_important", None)
         for field, value in values.items():
             setattr(state, field, value)
-        if important is not None:
-            state.metadata = {**(state.metadata or {}), "is_important": important}
         state.last_seen_at = timezone.now()
         state.save()
         return response.Response(EmailMessageUserStateSerializer(state).data)
@@ -390,12 +472,20 @@ class EmailMessageViewSet(viewsets.ModelViewSet):
         if len(messages) != len(set(ids)):
             raise exceptions.NotFound("One or more messages were not found.")
 
-        states = []
+        # Batched: one query to load existing states, then a single bulk_create
+        # and a single bulk_update instead of a SELECT+SAVE per message (N+1).
+        existing = {
+            state.message_id: state
+            for state in EmailMessageUserState.objects.filter(
+                user=request.user, message__in=messages
+            )
+        }
         now = timezone.now()
+        states = []
+        to_create = []
+        to_update = []
         for message in messages:
-            state = EmailMessageUserState.objects.filter(
-                user=request.user, message=message
-            ).first()
+            state = existing.get(message.id)
             if state is None:
                 state = EmailMessageUserState(
                     user=request.user,
@@ -404,18 +494,21 @@ class EmailMessageViewSet(viewsets.ModelViewSet):
                     is_read=message.is_read,
                     is_starred=message.is_starred,
                 )
-            important = values.get("is_important")
+                to_create.append(state)
+            else:
+                to_update.append(state)
             for field, value in values.items():
-                if field != "is_important":
-                    setattr(state, field, value)
-            if important is not None:
-                state.metadata = {
-                    **(state.metadata or {}),
-                    "is_important": important,
-                }
+                setattr(state, field, value)
             state.last_seen_at = now
-            state.save()
+            state.updated_at = now
             states.append(state)
+
+        update_fields = list(values.keys()) + ["last_seen_at", "updated_at"]
+        with transaction.atomic():
+            if to_create:
+                EmailMessageUserState.objects.bulk_create(to_create)
+            if to_update:
+                EmailMessageUserState.objects.bulk_update(to_update, update_fields)
 
         output = EmailMessageUserStateSerializer(
             states, many=True, context=self.get_serializer_context()
@@ -437,7 +530,7 @@ class EmailRecipientViewSet(viewsets.ReadOnlyModelViewSet):
 class EmailMessageUserStateViewSet(viewsets.ModelViewSet):
     serializer_class = EmailMessageUserStateSerializer
     filterset_class = EmailMessageUserStateFilter
-    ordering_fields = ["updated_at", "snoozed_until"]
+    ordering_fields = ["updated_at", "snoozed_until", "is_important"]
 
     def get_queryset(self):
         return EmailMessageUserState.objects.for_api_user(
