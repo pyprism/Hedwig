@@ -1,5 +1,8 @@
 # Hedwig [![CI](https://github.com/pyprism/Hedwig/actions/workflows/ci.yml/badge.svg)](https://github.com/pyprism/Hedwig/actions/workflows/ci.yml) [![codecov](https://codecov.io/gh/pyprism/Hedwig/graph/badge.svg?token=JMKaZbOg7J)](https://codecov.io/gh/pyprism/Hedwig)
 
+<div align="center"><img src="potter.png" alt="Hedwig logo" width="200" style="max-width:200px; height:auto;"></div>
+
+
 A Django REST Framework backend for managing shared email inboxes.
 Built for personal use, small teams, helpdesks, or anyone who needs multiple people
 working out of the same mailbox. Hedwig manages mailboxes and domains,
@@ -68,3 +71,7 @@ ansible-playbook -i inventories/production deploy.yaml -K
 ```
 ## License
 MIT
+
+## Icon Credit
+Hedwig icons created by Vector Squad - Flaticon
+[https://www.flaticon.com/free-icon/potter_13717556](https://www.flaticon.com/free-icon/potter_13717556)
