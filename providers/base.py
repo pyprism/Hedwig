@@ -143,3 +143,15 @@ class BaseEmailProvider(ABC):
         Returns ``(True, "")`` on success or ``(False, error_message)`` on failure.
         """
         raise NotImplementedError
+
+    @abstractmethod
+    def register_domain(self, domain):
+        """Register a newly created ``Domain`` with the provider and populate
+        its ``DomainDnsRecord`` checklist (DKIM, return-path, ...)."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def check_domain(self, domain):
+        """Re-check DNS for an already-registered ``Domain`` and sync
+        verification state back onto it."""
+        raise NotImplementedError
