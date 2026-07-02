@@ -51,6 +51,37 @@ def test_register_domain_populates_pending_dns_records(
     assert records["return_path"].status == "pending"
 
 
+def test_register_domain_adopts_existing_postmark_domain(
+    requests_mock, postmark_provider, domain
+):
+    """If the domain was already added to Postmark outside Hedwig, adopt it
+    instead of failing on Postmark's "already exists" error."""
+    postmark_provider.credentials["account_token"] = "acct-token"
+    postmark_provider.save(update_fields=["credentials"])
+
+    requests_mock.post(
+        "https://api.postmarkapp.com/domains",
+        status_code=422,
+        json={"ErrorCode": 300, "Message": "Domain already exists at Postmark.com."},
+    )
+    requests_mock.get(
+        "https://api.postmarkapp.com/domains",
+        json={"TotalCount": 1, "Domains": [{"ID": 42, "Name": "example.com"}]},
+    )
+    requests_mock.get(
+        "https://api.postmarkapp.com/domains/42",
+        json=_postmark_domain_payload(),
+    )
+
+    provider_impl = get_provider(postmark_provider)
+    provider_impl.register_domain(domain)
+
+    domain.refresh_from_db()
+    assert domain.status == DomainStatus.PENDING
+    assert domain.provider_domain_id == "42"
+    assert domain.dns_record_set.count() == 2
+
+
 def test_check_domain_marks_verified_when_dns_passes(
     requests_mock, postmark_provider, domain
 ):
