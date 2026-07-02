@@ -16,8 +16,15 @@ from providers.base import (
     NormalizedInboundMessage,
     ParsedWebhookEvent,
 )
-from providers.models import Domain, EmailProvider
-from utils.enums import EmailStatus, EventType, ProviderType, SendAttemptStatus
+from providers.models import Domain, DomainDnsRecord, EmailProvider
+from utils.enums import (
+    DnsRecordStatus,
+    DomainStatus,
+    EmailStatus,
+    EventType,
+    ProviderType,
+    SendAttemptStatus,
+)
 from utils.s3 import get_s3_uploader
 
 
@@ -367,6 +374,98 @@ class PostmarkProvider(BaseEmailProvider):
             return False, "; ".join(exc.messages)
         return client.check_health()
 
+    def register_domain(self, domain):
+        """Register a newly created domain with Postmark and store the DNS
+        records the admin must configure (DKIM CNAME/TXT, Return-Path CNAME)."""
+        client = PostmarkClient(self.provider)
+        data = client.create_domain(domain.name)
+        self._apply_domain_response(domain, data)
+
+    def check_domain(self, domain):
+        """Ask Postmark to re-check DNS for an already-registered domain and
+        sync the verification state back onto ``domain``/``DomainDnsRecord``."""
+        client = PostmarkClient(self.provider)
+        data = client.recheck_dkim(domain.provider_domain_id)
+        data.update(client.recheck_return_path(domain.provider_domain_id))
+        self._apply_domain_response(domain, data)
+
+    def _apply_domain_response(self, domain, data):
+        now = timezone.now()
+        record_specs = []
+
+        dkim_host = data.get("DKIMPendingHost") or data.get("DKIMHost")
+        dkim_value = data.get("DKIMPendingTextValue") or data.get("DKIMTextValue")
+        if dkim_host and dkim_value:
+            record_specs.append(
+                ("TXT", dkim_host, dkim_value, "dkim", bool(data.get("DKIMVerified")))
+            )
+
+        return_path_host = data.get("ReturnPathDomain")
+        return_path_value = data.get("ReturnPathDomainCNAMEValue")
+        if return_path_host and return_path_value:
+            record_specs.append(
+                (
+                    "CNAME",
+                    return_path_host,
+                    return_path_value,
+                    "return_path",
+                    bool(data.get("ReturnPathDomainVerified")),
+                )
+            )
+
+        spf_host = data.get("SPFHost")
+        spf_value = data.get("SPFTextValue")
+        if spf_host and spf_value:
+            record_specs.append(
+                ("TXT", spf_host, spf_value, "spf", bool(data.get("SPFVerified")))
+            )
+
+        kept_ids = []
+        for record_type, host, value, purpose, verified in record_specs:
+            record, _ = DomainDnsRecord.objects.update_or_create(
+                domain=domain,
+                record_type=record_type,
+                host=host,
+                value=value,
+                purpose=purpose,
+                defaults={
+                    "status": (
+                        DnsRecordStatus.VERIFIED
+                        if verified
+                        else DnsRecordStatus.PENDING
+                    ),
+                    "last_checked_at": now,
+                    "last_error": "",
+                },
+            )
+            kept_ids.append(record.id)
+        domain.dns_record_set.exclude(id__in=kept_ids).delete()
+
+        domain.provider_domain_id = str(
+            data.get("ID") or domain.provider_domain_id or ""
+        )
+        domain.dns_records = data
+        domain.last_error = ""
+        domain.dns_checked_at = now
+        domain.status = (
+            DomainStatus.VERIFIED
+            if record_specs and all(verified for *_, verified in record_specs)
+            else DomainStatus.PENDING
+        )
+        if domain.status == DomainStatus.VERIFIED and not domain.verified_at:
+            domain.verified_at = now
+        domain.save(
+            update_fields=[
+                "provider_domain_id",
+                "dns_records",
+                "last_error",
+                "dns_checked_at",
+                "status",
+                "verified_at",
+                "updated_at",
+            ]
+        )
+
 
 class PostmarkClient:
     def __init__(self, provider):
@@ -502,6 +601,53 @@ class PostmarkClient:
             ]
         )
         return data
+
+    def _account_headers(self):
+        account_token = self.provider.credentials.get("account_token")
+        if not account_token:
+            raise ValidationError(
+                "Postmark provider is missing an account token "
+                "(credentials.account_token) required for domain management."
+            )
+        return {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "X-Postmark-Account-Token": account_token,
+        }
+
+    def _domain_response(self, response):
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise ValidationError("Postmark returned a non-JSON response.") from exc
+        if response.status_code >= 400 or data.get("ErrorCode"):
+            raise ValidationError(data.get("Message", response.text)[:500])
+        return data
+
+    def create_domain(self, name):
+        response = requests.post(
+            f"{self.base_url}/domains",
+            json={"Name": name},
+            headers=self._account_headers(),
+            timeout=20,
+        )
+        return self._domain_response(response)
+
+    def recheck_dkim(self, provider_domain_id):
+        response = requests.put(
+            f"{self.base_url}/domains/{provider_domain_id}/verifydkim",
+            headers=self._account_headers(),
+            timeout=20,
+        )
+        return self._domain_response(response)
+
+    def recheck_return_path(self, provider_domain_id):
+        response = requests.put(
+            f"{self.base_url}/domains/{provider_domain_id}/verifyReturnPath",
+            headers=self._account_headers(),
+            timeout=20,
+        )
+        return self._domain_response(response)
 
     def check_health(self):
         """Verify the server token/connectivity via Postmark's GET /server endpoint."""
