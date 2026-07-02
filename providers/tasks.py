@@ -6,9 +6,14 @@ from django.db import models
 from django.utils import timezone
 
 from providers.ingest import process_webhook_log
-from providers.models import DailyDomainSendLog, EmailProvider, ProviderWebhookLog
+from providers.models import (
+    DailyDomainSendLog,
+    Domain,
+    EmailProvider,
+    ProviderWebhookLog,
+)
 from providers.registry import get_provider
-from utils.enums import ProviderWebhookStatus
+from utils.enums import DomainStatus, ProviderWebhookStatus
 
 RETRYABLE_STATUSES = {
     ProviderWebhookStatus.PENDING,
@@ -74,6 +79,44 @@ def check_all_providers_health_task():
     for provider_id in provider_ids:
         check_provider_health_task.delay(provider_id)
     return {"dispatched": len(provider_ids)}
+
+
+@shared_task(bind=True, max_retries=5)
+def check_domain_dns_task(self, domain_id):
+    """Register the domain with its provider (first run) or re-check DNS
+    (subsequent runs), syncing ``Domain.status``/``DomainDnsRecord`` rows."""
+    domain = Domain.objects.select_related("provider").filter(pk=domain_id).first()
+    if domain is None:
+        return {"status": "missing", "id": str(domain_id)}
+
+    provider_impl = get_provider(domain.provider)
+    try:
+        if domain.provider_domain_id:
+            provider_impl.check_domain(domain)
+        else:
+            provider_impl.register_domain(domain)
+    except Exception as exc:
+        domain.status = DomainStatus.FAILED
+        domain.last_error = str(exc)
+        domain.dns_checked_at = timezone.now()
+        domain.save(
+            update_fields=["status", "last_error", "dns_checked_at", "updated_at"]
+        )
+        raise self.retry(exc=exc, countdown=min(60 * 2**self.request.retries, 3600))
+    return {"status": domain.status, "id": str(domain_id)}
+
+
+@shared_task
+def check_pending_domains_dns_task():
+    """Beat entry point: re-check DNS for every domain not yet verified."""
+    domain_ids = list(
+        Domain.objects.filter(is_active=True)
+        .exclude(status=DomainStatus.VERIFIED)
+        .values_list("id", flat=True)
+    )
+    for domain_id in domain_ids:
+        check_domain_dns_task.delay(domain_id)
+    return {"dispatched": len(domain_ids)}
 
 
 @shared_task
