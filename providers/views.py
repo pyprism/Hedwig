@@ -38,7 +38,7 @@ from providers.serializers import (
     EmailProviderSerializer,
     ProviderWebhookLogSerializer,
 )
-from providers.tasks import process_webhook_log_task
+from providers.tasks import check_domain_dns_task, process_webhook_log_task
 from utils.enums import ProviderType, ProviderWebhookStatus
 from utils.permissions import IsStaffOrReadOnly, IsStaffUser
 
@@ -62,6 +62,28 @@ class DomainViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         return Domain.objects.for_api_user(self.request.user).select_related("provider")
+
+    def perform_create(self, serializer):
+        domain = serializer.save()
+        transaction.on_commit(
+            lambda domain_id=domain.id: check_domain_dns_task.delay(domain_id)
+        )
+
+    @decorators.action(
+        detail=True,
+        methods=["post"],
+        url_path="check-dns",
+        permission_classes=[IsStaffUser],
+    )
+    def check_dns(self, request, pk=None):
+        domain = self.get_object()
+        transaction.on_commit(
+            lambda domain_id=domain.id: check_domain_dns_task.delay(domain_id)
+        )
+        return response.Response(
+            {"id": str(domain.id), "status": domain.status, "result": "queued"},
+            status=status.HTTP_202_ACCEPTED,
+        )
 
 
 class DomainDnsRecordViewSet(viewsets.ModelViewSet):
