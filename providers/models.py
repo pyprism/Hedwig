@@ -26,7 +26,8 @@ class EmailProvider(models.Model):
 
     Credentials shape per provider:
       AWS SES    → { "access_key_id": "...", "secret_access_key": "...", "region": "us-east-1" }
-      Postmark   → { "server_token": "..." }
+      Postmark   → { "server_token": "...", "account_token": "..." (optional, required for
+                     domain registration/DNS verification, distinct from the server token) }
       Mailgun    → { "api_key": "...", "base_url": "https://api.mailgun.net" }
     """
 
