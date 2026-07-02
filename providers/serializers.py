@@ -59,13 +59,21 @@ class EmailProviderSerializer(serializers.ModelSerializer):
         provider_type = attrs.get(
             "provider_type", getattr(self.instance, "provider_type", None)
         )
-        credentials = attrs.get(
-            "credentials", getattr(self.instance, "credentials", None) or {}
-        )
+        credentials = attrs.get("credentials")
+        if credentials is not None and self.instance is not None:
+            merged_credentials = {**(self.instance.credentials or {}), **credentials}
+        else:
+            merged_credentials = (
+                credentials
+                if credentials is not None
+                else (getattr(self.instance, "credentials", None) or {})
+            )
         if (
             provider_type == ProviderType.POSTMARK
-            and credentials
-            and not any(key in credentials for key in ("server_token", "api_token"))
+            and merged_credentials
+            and not any(
+                key in merged_credentials for key in ("server_token", "api_token")
+            )
         ):
             raise serializers.ValidationError(
                 {
@@ -75,6 +83,14 @@ class EmailProviderSerializer(serializers.ModelSerializer):
                 }
             )
         return attrs
+
+    def update(self, instance, validated_data):
+        if "credentials" in validated_data:
+            validated_data["credentials"] = {
+                **(instance.credentials or {}),
+                **validated_data["credentials"],
+            }
+        return super().update(instance, validated_data)
 
 
 class DomainDnsRecordSerializer(serializers.ModelSerializer):
