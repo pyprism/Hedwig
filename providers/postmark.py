@@ -376,9 +376,23 @@ class PostmarkProvider(BaseEmailProvider):
 
     def register_domain(self, domain):
         """Register a newly created domain with Postmark and store the DNS
-        records the admin must configure (DKIM CNAME/TXT, Return-Path CNAME)."""
+        records the admin must configure (DKIM CNAME/TXT, Return-Path CNAME).
+
+        If the domain was already added to Postmark directly (outside Hedwig),
+        Postmark rejects the create call with "domain already exists" — in
+        that case, adopt the existing Postmark domain instead of failing.
+        """
         client = PostmarkClient(self.provider)
-        data = client.create_domain(domain.name)
+        try:
+            data = client.create_domain(domain.name)
+        except ValidationError as exc:
+            message = "; ".join(exc.messages)
+            if "already exists" not in message.lower():
+                raise
+            existing = client.find_domain_by_name(domain.name)
+            if existing is None:
+                raise
+            data = client.get_domain(existing["ID"])
         self._apply_domain_response(domain, data)
 
     def check_domain(self, domain):
@@ -632,6 +646,35 @@ class PostmarkClient:
             timeout=20,
         )
         return self._domain_response(response)
+
+    def get_domain(self, provider_domain_id):
+        response = requests.get(
+            f"{self.base_url}/domains/{provider_domain_id}",
+            headers=self._account_headers(),
+            timeout=20,
+        )
+        return self._domain_response(response)
+
+    def list_domains(self, count=300, offset=0):
+        response = requests.get(
+            f"{self.base_url}/domains",
+            params={"count": count, "offset": offset},
+            headers=self._account_headers(),
+            timeout=20,
+        )
+        return self._domain_response(response)
+
+    def find_domain_by_name(self, name):
+        offset = 0
+        count = 300
+        while True:
+            data = self.list_domains(count=count, offset=offset)
+            for entry in data.get("Domains", []):
+                if entry.get("Name", "").lower() == name.lower():
+                    return entry
+            offset += count
+            if offset >= data.get("TotalCount", 0):
+                return None
 
     def recheck_dkim(self, provider_domain_id):
         response = requests.put(
