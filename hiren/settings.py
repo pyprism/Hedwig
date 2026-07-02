@@ -436,6 +436,9 @@ WEBHOOK_LOG_RETRY_STALE_MINUTES = int(
 )
 WEBHOOK_LOG_MAX_ATTEMPTS = int(os.environ.get("webhook_log_max_attempts", 10))
 DAILY_SEND_LOG_RETENTION_DAYS = int(os.environ.get("daily_send_log_retention_days", 90))
+DOMAIN_DNS_CHECK_INTERVAL_MINUTES = int(
+    os.environ.get("domain_dns_check_interval_minutes", 15)
+)
 
 CELERY_BEAT_SCHEDULE = {
     "check-provider-health": {
@@ -461,5 +464,9 @@ CELERY_BEAT_SCHEDULE = {
     "reconcile-mailbox-used-bytes": {
         "task": "hedwig.tasks.reconcile_mailbox_used_bytes_task",
         "schedule": timedelta(hours=6),
+    },
+    "check-pending-domains-dns": {
+        "task": "providers.tasks.check_pending_domains_dns_task",
+        "schedule": timedelta(minutes=DOMAIN_DNS_CHECK_INTERVAL_MINUTES),
     },
 }
