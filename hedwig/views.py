@@ -360,22 +360,8 @@ class EmailMessageViewSet(viewsets.ModelViewSet):
                 "Only queued outbound messages can be cancelled."
             )
 
-        attempt = message.send_attempts.filter(status=SendAttemptStatus.PENDING).first()
-        if attempt is None:
+        if not EmailMessage.objects.cancel_scheduled_send(message):
             raise exceptions.ValidationError("No pending send attempt to cancel.")
-
-        attempt.status = SendAttemptStatus.CANCELLED
-        attempt.finished_at = timezone.now()
-        attempt.save(update_fields=["status", "finished_at"])
-
-        # Turn the cancelled send back into a plain editable draft: it returns to
-        # Drafts and drops its schedule, so the author can edit and re-send it via
-        # the normal draft endpoints (which require status=draft). Staged
-        # attachments are kept for the re-send.
-        message.status = EmailStatus.DRAFT
-        message.folder = Folder.DRAFTS
-        message.scheduled_at = None
-        message.save(update_fields=["status", "folder", "scheduled_at", "updated_at"])
 
         return response.Response(self.get_serializer(message).data)
 
@@ -433,6 +419,12 @@ class EmailMessageViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         values = serializer.validated_data
 
+        if values.get("folder") == Folder.TRASH:
+            # Trashing a still-queued scheduled send would otherwise leave it
+            # to fire later regardless of the user's per-user folder move —
+            # cancel it in place, same as the explicit "Cancel send" action.
+            EmailMessage.objects.cancel_scheduled_send(message)
+
         state = EmailMessageUserState.objects.filter(
             user=request.user, message=message
         ).first()
@@ -469,6 +461,12 @@ class EmailMessageViewSet(viewsets.ModelViewSet):
         messages = list(self.get_queryset().filter(id__in=ids))
         if len(messages) != len(set(ids)):
             raise exceptions.NotFound("One or more messages were not found.")
+
+        if values.get("folder") == Folder.TRASH:
+            # See EmailMessageViewSet.state: bulk-trashing must cancel any
+            # still-queued scheduled sends in the batch too.
+            for message in messages:
+                EmailMessage.objects.cancel_scheduled_send(message)
 
         # Batched: one query to load existing states, then a single bulk_create
         # and a single bulk_update instead of a SELECT+SAVE per message (N+1).
