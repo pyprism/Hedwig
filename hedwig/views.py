@@ -80,6 +80,19 @@ from utils.permissions import (
 )
 
 
+def _enqueue_send(message, attempt):
+    """Dispatch a send attempt, or defer it to the scheduled-send sweeper.
+
+    A future-dated send is left ``queued`` with its ``PENDING`` attempt;
+    ``dispatch_due_scheduled_sends_task`` (Celery beat) picks it up when due.
+    This avoids Celery ``eta``, which on RabbitMQ is held in worker memory and
+    is unreliable across restarts / long horizons. Immediate sends dispatch now.
+    """
+    if message.scheduled_at and message.scheduled_at > timezone.now():
+        return
+    send_email_message_task.apply_async(args=[str(message.id), str(attempt.id)])
+
+
 class StaffWritableScopedModelViewSet(viewsets.ModelViewSet):
     permission_classes = [IsStaffOrReadOnly]
 
@@ -264,17 +277,7 @@ class EmailMessageViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         message = serializer.save()
         attempt = message._send_attempt
-
-        def enqueue_send():
-            options = {}
-            if message.scheduled_at:
-                options["eta"] = message.scheduled_at
-            send_email_message_task.apply_async(
-                args=[str(message.id), str(attempt.id)],
-                **options,
-            )
-
-        transaction.on_commit(enqueue_send)
+        transaction.on_commit(lambda: _enqueue_send(message, attempt))
         output = self.get_serializer(message)
         return response.Response(output.data, status=status.HTTP_202_ACCEPTED)
 
@@ -316,17 +319,7 @@ class EmailMessageViewSet(viewsets.ModelViewSet):
             raise exceptions.ValidationError("Provide body_text or body_html.")
 
         message, attempt = EmailMessage.objects.promote_draft_to_send(message)
-
-        def enqueue_send():
-            options = {}
-            if message.scheduled_at:
-                options["eta"] = message.scheduled_at
-            send_email_message_task.apply_async(
-                args=[str(message.id), str(attempt.id)],
-                **options,
-            )
-
-        transaction.on_commit(enqueue_send)
+        transaction.on_commit(lambda: _enqueue_send(message, attempt))
         return response.Response(
             self.get_serializer(message).data, status=status.HTTP_202_ACCEPTED
         )

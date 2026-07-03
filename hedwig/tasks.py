@@ -15,7 +15,7 @@ from hedwig.models import (
 from providers.postmark import TransientSendError
 from providers.sending import send_with_provider
 from utils.s3 import get_s3_uploader
-from utils.enums import EmailStatus, SendAttemptStatus
+from utils.enums import DirectionType, EmailStatus, SendAttemptStatus
 
 
 @shared_task(bind=True, max_retries=3, default_retry_delay=60)
@@ -91,6 +91,32 @@ def mark_attempt_failed(attempt_id, code, message):
 
         attempt.message.status = EmailStatus.FAILED
         attempt.message.save(update_fields=["status", "updated_at"])
+
+
+@shared_task
+def dispatch_due_scheduled_sends_task():
+    """Beat entry point: dispatch scheduled sends whose time has arrived.
+
+    Scheduling does not rely on Celery ``eta`` (in-memory on RabbitMQ, so it is
+    lost/stalled across worker restarts, reconnects and long horizons). Instead
+    the send is left ``queued`` with a ``PENDING`` attempt and a future
+    ``scheduled_at``; this sweep enqueues each due attempt for immediate send.
+    ``reserve_attempt_for_sending`` guards against double-dispatch, so this is
+    safe to run every minute and idempotent if an attempt is already in flight.
+    """
+    now = timezone.now()
+    due = list(
+        OutboundSendAttempt.objects.filter(
+            status=SendAttemptStatus.PENDING,
+            message__direction=DirectionType.OUTBOUND,
+            message__status=EmailStatus.QUEUED,
+            message__scheduled_at__isnull=False,
+            message__scheduled_at__lte=now,
+        ).values_list("message_id", "id")
+    )
+    for message_id, attempt_id in due:
+        send_email_message_task.delay(str(message_id), str(attempt_id))
+    return {"dispatched": len(due)}
 
 
 @shared_task

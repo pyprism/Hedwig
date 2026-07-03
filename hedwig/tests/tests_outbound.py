@@ -304,6 +304,8 @@ def test_send_email_scheduled_does_not_dispatch_immediately(
 
     scheduled_at = timezone.now() + timedelta(hours=1)
 
+    # A future-dated send is NOT dispatched now (no Celery eta); it stays queued
+    # and the beat sweeper picks it up when due.
     with patch("hedwig.views.send_email_message_task.apply_async") as apply_async:
         with django_capture_on_commit_callbacks(execute=True):
             response = authed_client.post(
@@ -319,8 +321,51 @@ def test_send_email_scheduled_does_not_dispatch_immediately(
     message = EmailMessage.objects.get(pk=response.data["id"])
     assert message.status == EmailStatus.QUEUED
 
-    apply_async.assert_called_once()
-    assert apply_async.call_args.kwargs["eta"] == scheduled_at
+    apply_async.assert_not_called()
+
+
+def test_due_scheduled_send_is_dispatched_by_sweeper(
+    authed_client,
+    mailbox,
+    sender_identity,
+    requests_mock,
+    django_capture_on_commit_callbacks,
+):
+    from datetime import timedelta
+    from unittest.mock import patch
+
+    from django.utils import timezone
+
+    from hedwig.tasks import dispatch_due_scheduled_sends_task
+
+    scheduled_at = timezone.now() + timedelta(hours=1)
+
+    with patch("hedwig.views.send_email_message_task.apply_async"):
+        with django_capture_on_commit_callbacks(execute=True):
+            response = authed_client.post(
+                SEND_URL,
+                _send_payload(
+                    mailbox=str(mailbox.id), scheduled_at=scheduled_at.isoformat()
+                ),
+                format="json",
+            )
+    assert response.status_code == 202
+    message_id = response.data["id"]
+
+    # Not due yet → sweeper leaves it alone.
+    with patch("hedwig.tasks.send_email_message_task.delay") as delay:
+        result = dispatch_due_scheduled_sends_task()
+    assert result == {"dispatched": 0}
+    delay.assert_not_called()
+
+    # Move its scheduled time into the past → sweeper dispatches it once.
+    EmailMessage.objects.filter(pk=message_id).update(
+        scheduled_at=timezone.now() - timedelta(minutes=1)
+    )
+    with patch("hedwig.tasks.send_email_message_task.delay") as delay:
+        result = dispatch_due_scheduled_sends_task()
+    assert result == {"dispatched": 1}
+    delay.assert_called_once()
 
 
 def test_send_email_postmark_error_marks_attempt_failed(
