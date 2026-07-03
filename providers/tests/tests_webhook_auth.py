@@ -37,6 +37,47 @@ def test_valid_secret_accepted(api_client, settings, domain, mailbox):
     assert log.signature_valid is True
 
 
+def test_webhook_log_never_persists_secret_headers(
+    api_client, settings, domain, mailbox
+):
+    settings.DEBUG = False
+    domain.webhook_secret = "correct-secret"
+    domain.save(update_fields=["webhook_secret"])
+
+    response = api_client.post(
+        WEBHOOK_URL,
+        _inbound_payload(),
+        format="json",
+        HTTP_X_HEDWIG_WEBHOOK_SECRET="correct-secret",
+        HTTP_X_HOOKDECK_WEBHOOK_SECRET="another-secret",
+        HTTP_X_API_KEY="unrelated-but-sensitive-looking",
+    )
+
+    assert response.status_code == 200
+    log = ProviderWebhookLog.objects.get(provider_event_id="inbound:pm-auth-1")
+    stored_keys = {key.lower() for key in log.headers}
+    assert "x-hedwig-webhook-secret" not in stored_keys
+    assert "x-hookdeck-webhook-secret" not in stored_keys
+    assert "x-api-key" not in stored_keys
+    assert "content-type" in stored_keys
+
+
+def test_sanitized_webhook_headers_drops_authorization():
+    from providers.views import _sanitized_webhook_headers
+
+    class _FakeRequest:
+        headers = {
+            "Authorization": "Bearer super-secret-token",
+            "Content-Type": "application/json",
+            "User-Agent": "Postmark",
+        }
+
+    sanitized = _sanitized_webhook_headers(_FakeRequest())
+
+    assert "Authorization" not in sanitized
+    assert sanitized == {"Content-Type": "application/json", "User-Agent": "Postmark"}
+
+
 def test_generic_provider_webhook_url_accepts_registered_provider(
     api_client, settings, domain, mailbox
 ):
