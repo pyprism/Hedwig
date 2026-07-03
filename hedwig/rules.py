@@ -6,6 +6,8 @@ inbound ingestion (see ``providers.ingest.create_inbound_message``).
 
 from django.db import transaction
 
+from utils.enums import Folder
+
 
 SUPPORTED_CONDITIONS = {
     "from_contains",
@@ -22,6 +24,11 @@ SUPPORTED_ACTIONS = {
     "stop",
     "continue",
 }
+
+# Caps how many times a message can be re-forwarded (mailbox A -> B -> C ...)
+# before a rule's `forward_to` action is skipped, so two mailboxes forwarding
+# to each other (or a forward that loops back inbound) can't send indefinitely.
+MAX_FORWARD_DEPTH = 3
 
 
 def _rows_contain(rows, value):
@@ -76,7 +83,10 @@ def _apply_actions(mailbox, message, actions):
         EmailMessageLabel.objects.get_or_create(message=message, label=label)
 
     folder = actions.get("move_to_folder")
-    if folder and folder != message.folder:
+    # Belt-and-braces: MailboxRuleSerializer already rejects an invalid folder
+    # at save time, but this also guards rules persisted before that check
+    # existed (or written directly against the model).
+    if folder and folder in Folder.values and folder != message.folder:
         message.folder = folder
         message.save(update_fields=["folder", "updated_at"])
 
@@ -103,10 +113,32 @@ def evaluate_rules(mailbox, message):
                 break
 
 
+_FORWARD_DEPTH_HEADER = "X-Hedwig-Forward-Depth"
+
+
 def forward_message(message, to_email, reason="forward"):
-    """Forward an inbound ``message`` to ``to_email`` as a new outbound message."""
+    """Forward an inbound ``message`` to ``to_email`` as a new outbound message.
+
+    Returns ``None`` (without sending anything) if the forward would loop:
+    either straight back to the original sender, or past ``MAX_FORWARD_DEPTH``
+    hops. Depth is tracked via an ``X-Hedwig-Forward-Depth`` header carried on
+    the actual outgoing MIME message (see ``providers/postmark.py``'s use of
+    ``raw_headers``) so it survives the real send -> receive round trip between
+    two independently forwarding mailboxes, not just within one local record.
+    """
     from hedwig.models import EmailMessage
     from hedwig.tasks import send_email_message_task
+
+    if (
+        to_email
+        and message.from_address
+        and to_email.lower() == message.from_address.lower()
+    ):
+        return None
+
+    depth = _current_forward_depth(message)
+    if depth >= MAX_FORWARD_DEPTH:
+        return None
 
     mailbox = message.mailbox
     sender_identity = mailbox.sender_identities.filter(
@@ -132,6 +164,7 @@ def forward_message(message, to_email, reason="forward"):
         body_text=forwarded_header + (message.body_text or ""),
         body_html=message.body_html or "",
         metadata={"forwarded_from": str(message.id), "forward_reason": reason},
+        raw_headers={_FORWARD_DEPTH_HEADER: str(depth + 1)},
     )
     if message.has_attachments:
         _copy_attachments(message, new_message)
@@ -139,6 +172,17 @@ def forward_message(message, to_email, reason="forward"):
         lambda: send_email_message_task.delay(str(new_message.id), str(attempt.id))
     )
     return new_message
+
+
+def _current_forward_depth(message):
+    """How many times this message has already been forwarded, per the
+    ``X-Hedwig-Forward-Depth`` header carried on the wire (0 if absent/invalid,
+    i.e. this is the first hop)."""
+    raw = (message.raw_headers or {}).get(_FORWARD_DEPTH_HEADER)
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _copy_attachments(source_message, target_message):
