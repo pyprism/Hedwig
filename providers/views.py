@@ -155,6 +155,34 @@ class DeliveryEventViewSet(viewsets.ReadOnlyModelViewSet):
         )
 
 
+# Persisted indefinitely on every webhook log, so this is an allowlist rather
+# than a blocklist of known-sensitive names: webhook requests may carry
+# `Authorization`, our own `X-Hedwig-Webhook-Secret`/`X-Hookdeck-Webhook-Secret`
+# verification headers (see providers/postmark.py verify_webhook), or
+# provider API keys, none of which should ever land in the DB.
+_SAFE_WEBHOOK_HEADERS = {
+    "content-type",
+    "content-length",
+    "user-agent",
+    "accept",
+    "accept-encoding",
+    "accept-language",
+    "host",
+    "x-forwarded-for",
+    "x-forwarded-proto",
+    "x-forwarded-host",
+    "x-request-id",
+}
+
+
+def _sanitized_webhook_headers(request):
+    return {
+        name: value
+        for name, value in request.headers.items()
+        if name.lower() in _SAFE_WEBHOOK_HEADERS
+    }
+
+
 class ProviderWebhookViewSet(viewsets.ViewSet):
     """Receives provider webhooks using the registered provider implementation."""
 
@@ -172,7 +200,7 @@ class ProviderWebhookViewSet(viewsets.ViewSet):
             domain=None,
             provider_event_id="",
             event_type="provider_resolution_failed",
-            headers=dict(request.headers),
+            headers=_sanitized_webhook_headers(request),
             payload=payload,
             signature_valid=None,
             status=ProviderWebhookStatus.IGNORED,
@@ -218,7 +246,7 @@ class ProviderWebhookViewSet(viewsets.ViewSet):
             )
 
         kind, event_type, provider_event_id = provider_impl.classify_webhook(payload)
-        headers = dict(request.headers)
+        headers = _sanitized_webhook_headers(request)
 
         if provider_event_id:
             raw_webhook, created = ProviderWebhookLog.objects.get_or_create(
