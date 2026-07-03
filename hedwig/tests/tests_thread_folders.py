@@ -178,3 +178,25 @@ def test_scheduled_send_hidden_from_sent_until_it_fires(
 
     # A past-due send stays in Sent; the still-pending one does not.
     assert {r["id"] for r in sent.data["results"]} == {str(fired.id)}
+
+
+def test_trashing_a_scheduled_send_removes_it_from_scheduled(
+    api_client, regular_user, mailbox, mailbox_access
+):
+    thread = _thread(mailbox, "Trashed before it fired")
+    msg = _scheduled_message(mailbox, thread, timezone.now() + timedelta(hours=1))
+    EmailMessageUserState.objects.create(
+        user=regular_user, message=msg, folder=Folder.TRASH
+    )
+
+    api_client.force_authenticate(regular_user)
+
+    scheduled = api_client.get(
+        "/api/mail/threads/", {"mailbox": mailbox.id, "folder": "scheduled"}
+    )
+    trash = api_client.get(
+        "/api/mail/threads/", {"mailbox": mailbox.id, "folder": "trash"}
+    )
+
+    assert scheduled.data["results"] == []
+    assert {r["id"] for r in trash.data["results"]} == {str(thread.id)}
