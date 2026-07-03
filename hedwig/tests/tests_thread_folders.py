@@ -7,7 +7,10 @@ thread's folder membership from the requesting user's effective message folder
 ``EmailMessage.folder``), and re-scopes count / unread to that folder.
 """
 
+from datetime import timedelta
+
 import pytest
+from django.utils import timezone
 
 from hedwig.models import EmailMessage, EmailMessageUserState, EmailThread
 from utils.enums import DirectionType, EmailStatus, Folder
@@ -124,3 +127,54 @@ def test_thread_can_appear_in_multiple_folders(
 
     assert {r["id"] for r in inbox.data["results"]} == {str(thread.id)}
     assert {r["id"] for r in archive.data["results"]} == {str(thread.id)}
+
+
+def _scheduled_message(mailbox, thread, when):
+    """A future-dated outbound send: folder=sent, status=queued server-side."""
+    return EmailMessage.objects.create(
+        mailbox=mailbox,
+        thread=thread,
+        direction=DirectionType.OUTBOUND,
+        status=EmailStatus.QUEUED,
+        folder=Folder.SENT,
+        is_read=True,
+        scheduled_at=when,
+        from_address=mailbox.email_address,
+        from_name="Me",
+        subject="Later",
+        to_addresses=[{"email": "bob@example.com", "name": "Bob"}],
+    )
+
+
+def test_scheduled_folder_lists_future_dated_sends(
+    api_client, regular_user, mailbox, mailbox_access
+):
+    thread = _thread(mailbox, "Scheduled one")
+    _scheduled_message(mailbox, thread, timezone.now() + timedelta(hours=1))
+
+    api_client.force_authenticate(regular_user)
+
+    scheduled = api_client.get(
+        "/api/mail/threads/", {"mailbox": mailbox.id, "folder": "scheduled"}
+    )
+
+    assert scheduled.status_code == 200
+    assert {r["id"] for r in scheduled.data["results"]} == {str(thread.id)}
+
+
+def test_scheduled_send_hidden_from_sent_until_it_fires(
+    api_client, regular_user, mailbox, mailbox_access
+):
+    pending = _thread(mailbox, "Still scheduled")
+    _scheduled_message(mailbox, pending, timezone.now() + timedelta(hours=1))
+    fired = _thread(mailbox, "Already sent")
+    _scheduled_message(mailbox, fired, timezone.now() - timedelta(hours=1))
+
+    api_client.force_authenticate(regular_user)
+
+    sent = api_client.get(
+        "/api/mail/threads/", {"mailbox": mailbox.id, "folder": "sent"}
+    )
+
+    # A past-due send stays in Sent; the still-pending one does not.
+    assert {r["id"] for r in sent.data["results"]} == {str(fired.id)}
