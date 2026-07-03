@@ -189,6 +189,7 @@ class EmailMessageManager(models.Manager.from_queryset(EmailMessageQuerySet)):
         thread=None,
         in_reply_to="",
         references="",
+        raw_headers=None,
     ):
         from hedwig.models import (
             Contact,
@@ -203,6 +204,7 @@ class EmailMessageManager(models.Manager.from_queryset(EmailMessageQuerySet)):
         bcc_addresses = bcc_addresses or []
         metadata = metadata or {}
         attachments = attachments or []
+        raw_headers = raw_headers or {}
 
         sender_email = (
             sender_identity.email if sender_identity else mailbox.email_address
@@ -242,6 +244,7 @@ class EmailMessageManager(models.Manager.from_queryset(EmailMessageQuerySet)):
                 is_read=True,
                 metadata=metadata,
                 scheduled_at=scheduled_at,
+                raw_headers=raw_headers,
             )
             update_thread_for_message(mailbox, message)
             for recipient_type, rows in (
@@ -536,6 +539,40 @@ class EmailMessageManager(models.Manager.from_queryset(EmailMessageQuerySet)):
                 request_payload={},
             )
         return message, attempt
+
+    def cancel_scheduled_send(self, message):
+        """Cancel a still-``queued`` outbound send's pending attempt and turn
+        it back into a plain editable draft. Returns ``True`` if a pending
+        attempt was cancelled, ``False`` if the message wasn't cancellable
+        (already sent, not outbound, or no pending attempt) so callers can
+        no-op instead of erroring.
+
+        Shared by the explicit ``cancel`` endpoint and by trashing a message
+        still in the ``scheduled`` view, which cancels-in-place rather than
+        letting a trashed message fire later.
+        """
+        if (
+            message.direction != DirectionType.OUTBOUND
+            or message.status != EmailStatus.QUEUED
+        ):
+            return False
+
+        attempt = message.send_attempts.filter(status=SendAttemptStatus.PENDING).first()
+        if attempt is None:
+            return False
+
+        with transaction.atomic():
+            attempt.status = SendAttemptStatus.CANCELLED
+            attempt.finished_at = timezone.now()
+            attempt.save(update_fields=["status", "finished_at"])
+
+            message.status = EmailStatus.DRAFT
+            message.folder = Folder.DRAFTS
+            message.scheduled_at = None
+            message.save(
+                update_fields=["status", "folder", "scheduled_at", "updated_at"]
+            )
+        return True
 
     def _stage_attachments(self, message, attachments):
         """Persist base64 attachments as EmailAttachment rows with the raw
