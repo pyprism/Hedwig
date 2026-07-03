@@ -416,6 +416,144 @@ def test_cancel_scheduled_send_converts_to_editable_draft(
     assert patch_draft.data["subject"] == "Edited after cancel"
 
 
+def test_trashing_a_scheduled_send_cancels_it(
+    authed_client,
+    mailbox,
+    sender_identity,
+    django_capture_on_commit_callbacks,
+):
+    from datetime import timedelta
+    from unittest.mock import patch
+
+    from django.utils import timezone
+
+    from hedwig.models import OutboundSendAttempt
+    from hedwig.tasks import dispatch_due_scheduled_sends_task
+
+    scheduled_at = timezone.now() + timedelta(hours=1)
+    with patch("hedwig.views.send_email_message_task.apply_async"):
+        with django_capture_on_commit_callbacks(execute=True):
+            response = authed_client.post(
+                SEND_URL,
+                _send_payload(
+                    mailbox=str(mailbox.id), scheduled_at=scheduled_at.isoformat()
+                ),
+                format="json",
+            )
+    message_id = response.data["id"]
+
+    state = authed_client.patch(
+        f"/api/mail/messages/{message_id}/state/",
+        {"folder": "trash"},
+        format="json",
+    )
+    assert state.status_code == 200
+
+    message = EmailMessage.objects.get(pk=message_id)
+    assert message.status == EmailStatus.DRAFT
+    assert message.scheduled_at is None
+    assert (
+        OutboundSendAttempt.objects.get(message=message).status
+        == SendAttemptStatus.CANCELLED
+    )
+
+    # The sweeper won't pick it up even if scheduled_at were somehow still due.
+    with patch("hedwig.tasks.send_email_message_task.delay") as delay:
+        result = dispatch_due_scheduled_sends_task()
+    assert result == {"dispatched": 0}
+    delay.assert_not_called()
+
+    # Trashing user still sees it in trash, even though the shared message
+    # reverted to a plain draft for anyone else with access to the mailbox.
+    threads = authed_client.get(
+        "/api/mail/threads/", {"mailbox": mailbox.id, "folder": "trash"}
+    )
+    assert message.thread_id is not None
+    assert str(message.thread_id) in {r["id"] for r in threads.data["results"]}
+
+
+def test_send_email_rejects_unsupported_metadata_key(
+    authed_client, mailbox, sender_identity
+):
+    response = authed_client.post(
+        SEND_URL,
+        _send_payload(mailbox=str(mailbox.id), metadata={"admin_override": True}),
+        format="json",
+    )
+    assert response.status_code == 400
+    assert "metadata" in response.data["errors"]
+
+
+def test_send_email_strips_server_reserved_metadata_keys(
+    authed_client, mailbox, sender_identity
+):
+    from unittest.mock import patch
+
+    with patch("hedwig.views.send_email_message_task.apply_async"):
+        response = authed_client.post(
+            SEND_URL,
+            _send_payload(
+                mailbox=str(mailbox.id),
+                metadata={"is_important": True, "forwarded_from": "spoofed-id"},
+            ),
+            format="json",
+        )
+    assert response.status_code == 202
+    message = EmailMessage.objects.get(pk=response.data["id"])
+    assert message.metadata == {"is_important": True}
+
+
+def test_send_email_rejects_oversized_metadata(authed_client, mailbox, sender_identity):
+    response = authed_client.post(
+        SEND_URL,
+        _send_payload(
+            mailbox=str(mailbox.id),
+            metadata={"tag": "x" * 5000},
+        ),
+        format="json",
+    )
+    assert response.status_code == 400
+    assert "metadata" in response.data["errors"]
+
+
+def test_send_email_rejects_scheduled_at_in_the_past(
+    authed_client, mailbox, sender_identity
+):
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    response = authed_client.post(
+        SEND_URL,
+        _send_payload(
+            mailbox=str(mailbox.id),
+            scheduled_at=(timezone.now() - timedelta(minutes=1)).isoformat(),
+        ),
+        format="json",
+    )
+    assert response.status_code == 400
+    assert "scheduled_at" in response.data["errors"]
+
+
+def test_send_email_rejects_scheduled_at_beyond_max_horizon(
+    authed_client, mailbox, sender_identity
+):
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    response = authed_client.post(
+        SEND_URL,
+        _send_payload(
+            mailbox=str(mailbox.id),
+            scheduled_at=(timezone.now() + timedelta(days=400)).isoformat(),
+        ),
+        format="json",
+    )
+    assert response.status_code == 400
+    assert "scheduled_at" in response.data["errors"]
+
+
 def test_send_email_postmark_error_marks_attempt_failed(
     authed_client,
     mailbox,
