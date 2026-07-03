@@ -441,6 +441,10 @@ DOMAIN_DNS_CHECK_INTERVAL_MINUTES = int(
 )
 
 CELERY_BEAT_SCHEDULE = {
+    "dispatch-due-scheduled-sends": {
+        "task": "hedwig.tasks.dispatch_due_scheduled_sends_task",
+        "schedule": timedelta(minutes=1),
+    },
     "check-provider-health": {
         "task": "providers.tasks.check_all_providers_health_task",
         "schedule": timedelta(minutes=PROVIDER_HEALTH_CHECK_INTERVAL_MINUTES),
