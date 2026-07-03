@@ -17,7 +17,7 @@ This codebase contains only backend, for cross-platform client [Hedwig-Client](h
 - Docker
 - Any AWS S3 compatible storage for storing files.
 - A domain
-- Postman account
+- Postmark account
 - Electricity is optional
 
 ## Status
