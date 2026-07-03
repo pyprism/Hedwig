@@ -368,9 +368,14 @@ class EmailMessageViewSet(viewsets.ModelViewSet):
         attempt.finished_at = timezone.now()
         attempt.save(update_fields=["status", "finished_at"])
 
-        message.status = EmailStatus.CANCELLED
+        # Turn the cancelled send back into a plain editable draft: it returns to
+        # Drafts and drops its schedule, so the author can edit and re-send it via
+        # the normal draft endpoints (which require status=draft). Staged
+        # attachments are kept for the re-send.
+        message.status = EmailStatus.DRAFT
         message.folder = Folder.DRAFTS
-        message.save(update_fields=["status", "folder", "updated_at"])
+        message.scheduled_at = None
+        message.save(update_fields=["status", "folder", "scheduled_at", "updated_at"])
 
         return response.Response(self.get_serializer(message).data)
 

@@ -368,6 +368,54 @@ def test_due_scheduled_send_is_dispatched_by_sweeper(
     delay.assert_called_once()
 
 
+def test_cancel_scheduled_send_converts_to_editable_draft(
+    authed_client,
+    mailbox,
+    sender_identity,
+    django_capture_on_commit_callbacks,
+):
+    from datetime import timedelta
+    from unittest.mock import patch
+
+    from django.utils import timezone
+
+    from hedwig.models import OutboundSendAttempt
+    from utils.enums import Folder
+
+    scheduled_at = timezone.now() + timedelta(hours=1)
+    with patch("hedwig.views.send_email_message_task.apply_async"):
+        with django_capture_on_commit_callbacks(execute=True):
+            response = authed_client.post(
+                SEND_URL,
+                _send_payload(
+                    mailbox=str(mailbox.id), scheduled_at=scheduled_at.isoformat()
+                ),
+                format="json",
+            )
+    message_id = response.data["id"]
+
+    cancel = authed_client.post(f"/api/mail/messages/{message_id}/cancel/")
+    assert cancel.status_code == 200
+
+    message = EmailMessage.objects.get(pk=message_id)
+    assert message.status == EmailStatus.DRAFT
+    assert message.folder == Folder.DRAFTS
+    assert message.scheduled_at is None
+    assert (
+        OutboundSendAttempt.objects.get(message=message).status
+        == SendAttemptStatus.CANCELLED
+    )
+
+    # Now editable via the draft endpoint (which rejects non-drafts).
+    patch_draft = authed_client.patch(
+        f"/api/mail/messages/{message_id}/draft/",
+        {"subject": "Edited after cancel"},
+        format="json",
+    )
+    assert patch_draft.status_code == 200
+    assert patch_draft.data["subject"] == "Edited after cancel"
+
+
 def test_send_email_postmark_error_marks_attempt_failed(
     authed_client,
     mailbox,
