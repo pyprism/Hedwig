@@ -1,7 +1,10 @@
 import base64
 import binascii
+import json
+from datetime import timedelta
 
 from django.db.models import Sum
+from django.utils import timezone
 from rest_framework import serializers
 
 from hedwig.filters import _search_tokens
@@ -23,7 +26,49 @@ from hedwig.models import (
     SuppressedAddress,
     UserMailboxAccess,
 )
-from utils.enums import AccessType
+from utils.enums import AccessType, Folder
+
+
+# `metadata` on an outbound/draft message is sender-controlled but later read
+# for trust-ish signals (e.g. `metadata.is_important` in `filters.filter_folder`)
+# and passed straight through to the provider (Postmark tag/tracking options),
+# so it's whitelisted and capped rather than accepted as an arbitrary bag.
+SUPPORTED_MESSAGE_METADATA_KEYS = {
+    "is_important",
+    "importance",
+    "tag",
+    "message_stream",
+    "track_opens",
+    "track_links",
+    "postmark_metadata",
+}
+# Set only by server-side flows (e.g. hedwig.rules.forward_message); silently
+# dropped rather than rejected so a client never needs to know they exist.
+RESERVED_MESSAGE_METADATA_KEYS = {"forwarded_from", "forward_reason"}
+MAX_MESSAGE_METADATA_BYTES = 4096
+
+
+def validate_message_metadata(value):
+    if not value:
+        return {}
+    if not isinstance(value, dict):
+        raise serializers.ValidationError("metadata must be an object.")
+
+    cleaned = {
+        key: val
+        for key, val in value.items()
+        if key not in RESERVED_MESSAGE_METADATA_KEYS
+    }
+    unsupported = sorted(set(cleaned) - SUPPORTED_MESSAGE_METADATA_KEYS)
+    if unsupported:
+        raise serializers.ValidationError(
+            f"Unsupported metadata key(s): {', '.join(unsupported)}."
+        )
+    if len(json.dumps(cleaned).encode("utf-8")) > MAX_MESSAGE_METADATA_BYTES:
+        raise serializers.ValidationError(
+            f"metadata must be at most {MAX_MESSAGE_METADATA_BYTES} bytes when serialized."
+        )
+    return cleaned
 
 
 def normalize_address_rows(rows):
@@ -594,7 +639,13 @@ class MailboxRuleSerializer(serializers.ModelSerializer):
         return self._validate_rule_keys(value, SUPPORTED_CONDITIONS, "conditions")
 
     def validate_actions(self, value):
-        return self._validate_rule_keys(value, SUPPORTED_ACTIONS, "actions")
+        value = self._validate_rule_keys(value, SUPPORTED_ACTIONS, "actions")
+        folder = value.get("move_to_folder")
+        if folder and folder not in Folder.values:
+            raise serializers.ValidationError(
+                {"move_to_folder": [f"'{folder}' is not a valid folder."]}
+            )
+        return value
 
     def _validate_rule_keys(self, value, supported_keys, label):
         if not isinstance(value, dict):
@@ -728,6 +779,22 @@ class SendEmailSerializer(serializers.Serializer):
     MAX_ATTACHMENTS = 10
     MAX_TOTAL_ATTACHMENT_BYTES = 10 * 1024 * 1024
     DEFAULT_MAX_RECIPIENTS = 50
+    MAX_SCHEDULE_HORIZON = timedelta(days=365)
+
+    def validate_metadata(self, value):
+        return validate_message_metadata(value)
+
+    def validate_scheduled_at(self, value):
+        if value is None:
+            return value
+        now = timezone.now()
+        if value <= now:
+            raise serializers.ValidationError("scheduled_at must be in the future.")
+        if value > now + self.MAX_SCHEDULE_HORIZON:
+            raise serializers.ValidationError(
+                f"scheduled_at must be within {self.MAX_SCHEDULE_HORIZON.days} days."
+            )
+        return value
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
