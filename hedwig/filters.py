@@ -20,7 +20,7 @@ from hedwig.models import (
     SuppressedAddress,
     UserMailboxAccess,
 )
-from utils.enums import DirectionType, EmailStatus
+from utils.enums import DirectionType, EmailStatus, Folder
 
 
 class MailboxFilter(django_filters.FilterSet):
@@ -124,10 +124,21 @@ class EmailThreadFilter(django_filters.FilterSet):
             # Virtual folder: future-dated outbound sends still waiting to fire.
             # They live in the SENT folder server-side (folder=sent,
             # status=queued) but surface under their own view until they send.
+            # Excludes messages the user has since moved to a hidden folder
+            # (trash/archive/spam) via their per-user state, mirroring the
+            # _state/messages__folder join used by the named-folder branch below.
+            hidden_folders = [Folder.TRASH, Folder.ARCHIVE, Folder.SPAM]
             in_folder = (
                 Q(messages__direction=DirectionType.OUTBOUND)
                 & Q(messages__status=EmailStatus.QUEUED)
                 & Q(messages__scheduled_at__gt=now)
+                & ~(
+                    Q(_state__folder__in=hidden_folders)
+                    | (
+                        Q(_state__pk__isnull=True)
+                        & Q(messages__folder__in=hidden_folders)
+                    )
+                )
             )
         else:
             in_folder = Q(_state__folder=value) | (
