@@ -20,6 +20,7 @@ from hedwig.models import (
     SuppressedAddress,
     UserMailboxAccess,
 )
+from utils.enums import DirectionType, EmailStatus
 
 
 class MailboxFilter(django_filters.FilterSet):
@@ -119,6 +120,15 @@ class EmailThreadFilter(django_filters.FilterSet):
             )
         elif value == "snoozed":
             in_folder = Q(_state__snoozed_until__gt=now)
+        elif value == "scheduled":
+            # Virtual folder: future-dated outbound sends still waiting to fire.
+            # They live in the SENT folder server-side (folder=sent,
+            # status=queued) but surface under their own view until they send.
+            in_folder = (
+                Q(messages__direction=DirectionType.OUTBOUND)
+                & Q(messages__status=EmailStatus.QUEUED)
+                & Q(messages__scheduled_at__gt=now)
+            )
         else:
             in_folder = Q(_state__folder=value) | (
                 Q(_state__pk__isnull=True) & Q(messages__folder=value)
@@ -126,6 +136,13 @@ class EmailThreadFilter(django_filters.FilterSet):
             if value == "inbox":
                 in_folder &= Q(_state__snoozed_until__isnull=True) | Q(
                     _state__snoozed_until__lte=now
+                )
+            elif value == "sent":
+                # Keep future-dated scheduled sends out of Sent — they belong to
+                # the "scheduled" view until they actually go out.
+                in_folder &= ~(
+                    Q(messages__status=EmailStatus.QUEUED)
+                    & Q(messages__scheduled_at__gt=now)
                 )
         unread_in_folder = in_folder & (
             Q(_state__is_read=False)
