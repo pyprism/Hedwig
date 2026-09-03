@@ -70,6 +70,11 @@ class UserSerializer(serializers.ModelSerializer):
 
 class CurrentUserSerializer(UserSerializer):
     class Meta(UserSerializer.Meta):
+        # `password` is an explicitly-declared field on UserSerializer, so listing it in
+        # read_only_fields (which only affects auto-generated fields) would NOT make it
+        # read-only here — it must be dropped from `fields` entirely. Password changes go
+        # through PasswordChangeSerializer, which verifies the current password.
+        fields = [f for f in UserSerializer.Meta.fields if f != "password"]
         read_only_fields = UserSerializer.Meta.read_only_fields + [
             "username",
             "email",
