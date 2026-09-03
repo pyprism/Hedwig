@@ -178,6 +178,7 @@ class EmailThreadFilter(django_filters.FilterSet):
         term = (value or "").strip()
         if not term:
             return queryset
+        user = getattr(self.request, "user", None)
         query = Q()
         free_terms = []
         for token in _search_tokens(term):
@@ -207,13 +208,17 @@ class EmailThreadFilter(django_filters.FilterSet):
                 query &= Q(has_unread=True) | Q(messages__is_read=False)
             elif key == "is" and value == "starred":
                 query &= Q(messages__is_starred=True) | Q(
-                    messages__user_states__is_starred=True
+                    messages__user_states__is_starred=True,
+                    messages__user_states__user=user,
                 )
             elif key == "is" and value == "important":
                 query &= (
                     Q(messages__metadata__is_important=True)
                     | Q(messages__metadata__importance__iexact="high")
-                    | Q(messages__user_states__is_important=True)
+                    | Q(
+                        messages__user_states__is_important=True,
+                        messages__user_states__user=user,
+                    )
                 )
             elif key == "after":
                 date = parse_date(value)

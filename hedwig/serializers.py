@@ -147,6 +147,27 @@ class MailboxSerializer(serializers.ModelSerializer):
     def validate_local_part(self, value):
         return value.strip().lower()
 
+    def validate(self, attrs):
+        is_catch_all = attrs.get(
+            "is_catch_all", getattr(self.instance, "is_catch_all", False)
+        )
+        domain = attrs.get("domain", getattr(self.instance, "domain", None))
+        if is_catch_all and domain is not None:
+            conflict = Mailbox.objects.filter(domain=domain, is_catch_all=True)
+            if self.instance is not None:
+                conflict = conflict.exclude(pk=self.instance.pk)
+            existing = conflict.first()
+            if existing is not None:
+                raise serializers.ValidationError(
+                    {
+                        "is_catch_all": [
+                            f"{existing.email_address} is already the catch-all mailbox "
+                            "for this domain — only one is allowed."
+                        ]
+                    }
+                )
+        return attrs
+
     def get_used_bytes(self, obj):
         if obj.used_bytes:
             return obj.used_bytes
@@ -169,15 +190,26 @@ class MailboxSerializer(serializers.ModelSerializer):
             "raw_headers",
             "has_attachments",
         )
+        # Attachment sizes are fetched in one aggregate query for every
+        # message that needs an estimate, instead of one aggregate query per
+        # message inside the loop — a paginated mailbox list with several
+        # attachment-bearing messages each without a stored size_bytes was
+        # fanning out to dozens of extra per-message queries per request.
+        estimate_ids = []
         for message in messages.iterator():
             if message.size_bytes:
                 total += message.size_bytes
                 continue
             total += estimate_stored_message_size(message)
             if message.has_attachments:
-                total += (
-                    message.attachments.aggregate(total=Sum("size_bytes"))["total"] or 0
-                )
+                estimate_ids.append(message.id)
+        if estimate_ids:
+            total += (
+                EmailAttachment.objects.filter(message_id__in=estimate_ids).aggregate(
+                    total=Sum("size_bytes")
+                )["total"]
+                or 0
+            )
         return total
 
 
@@ -481,6 +513,7 @@ class EmailMessageSerializer(serializers.ModelSerializer):
     folder = serializers.SerializerMethodField()
     is_read = serializers.SerializerMethodField()
     is_starred = serializers.SerializerMethodField()
+    is_important = serializers.SerializerMethodField()
 
     def _user_state(self, obj):
         states = getattr(obj, "prefetched_user_state", None)
@@ -497,6 +530,12 @@ class EmailMessageSerializer(serializers.ModelSerializer):
     def get_is_starred(self, obj):
         state = self._user_state(obj)
         return state.is_starred if state else obj.is_starred
+
+    def get_is_important(self, obj):
+        # Unlike is_read/is_starred, EmailMessage has no denormalized
+        # is_important column — it only lives on EmailMessageUserState.
+        state = self._user_state(obj)
+        return state.is_important if state else False
 
     class Meta:
         model = EmailMessage
@@ -530,6 +569,7 @@ class EmailMessageSerializer(serializers.ModelSerializer):
             "provider_message_id",
             "is_read",
             "is_starred",
+            "is_important",
             "has_attachments",
             "size_bytes",
             "spam_score",
@@ -1000,9 +1040,13 @@ class DraftEmailSerializer(SendEmailSerializer):
     )
 
     def validate(self, attrs):
-        attrs["to"] = normalize_address_rows(self._recipient_rows(attrs, "to") or [])
-        attrs["cc"] = normalize_address_rows(self._recipient_rows(attrs, "cc") or [])
-        attrs["bcc"] = normalize_address_rows(self._recipient_rows(attrs, "bcc") or [])
+        # On a partial update (PATCH), only touch to/cc/bcc when the caller actually
+        # supplied them — otherwise `rows or []` below would silently overwrite
+        # already-saved recipients with an empty list on every unrelated field edit.
+        for field in ("to", "cc", "bcc"):
+            rows = self._recipient_rows(attrs, field)
+            if rows is not None or not self.partial:
+                attrs[field] = normalize_address_rows(rows or [])
 
         mailbox = attrs.get("mailbox") or getattr(self.instance, "mailbox", None)
         if mailbox is None:

@@ -106,13 +106,20 @@ class Mailbox(models.Model):
         verbose_name = "Mailbox"
         verbose_name_plural = "Mailboxes"
         ordering = ["-created_at"]
-        # Enforce uniqueness of the full address within a domain
         constraints = [
+            # Enforce uniqueness of the full address within a domain
             models.UniqueConstraint(
                 Lower("local_part"),
                 "domain",
                 name="unique_mailbox_per_domain",
-            )
+            ),
+            # resolve_mailbox()'s catch-all fallback does .filter(is_catch_all=True).first() —
+            # if more than one existed for a domain, which one wins would be arbitrary/unstable.
+            models.UniqueConstraint(
+                "domain",
+                condition=models.Q(is_catch_all=True),
+                name="unique_catch_all_mailbox_per_domain",
+            ),
         ]
         indexes = [
             models.Index(fields=["domain", "is_active"]),

@@ -436,6 +436,22 @@ WEBHOOK_LOG_RETRY_STALE_MINUTES = int(
 )
 WEBHOOK_LOG_MAX_ATTEMPTS = int(os.environ.get("webhook_log_max_attempts", 10))
 DAILY_SEND_LOG_RETENTION_DAYS = int(os.environ.get("daily_send_log_retention_days", 90))
+# Raw webhook payloads (incl. full message bodies / base64 attachment content
+# for inbound mail) are redacted after this many days — the row itself
+# (status, error_message, timestamps) is kept for audit/debugging.
+WEBHOOK_LOG_PAYLOAD_RETENTION_DAYS = int(
+    os.environ.get("webhook_log_payload_retention_days", 30)
+)
+# Short mandatory delay before dispatching a non-scheduled ("send now") send,
+# giving POST /messages/{id}/cancel/ an actual grace window — Gmail-style
+# "undo send" — instead of the task typically already being SENDING/SENT
+# within moments of compose. Uses Celery countdown, not eta: short enough
+# (single-digit seconds) that the eta-unreliability-across-restarts concern
+# that rules out countdown/eta for scheduled_at (which can be days out) does
+# not apply here.
+IMMEDIATE_SEND_UNDO_WINDOW_SECONDS = int(
+    os.environ.get("immediate_send_undo_window_seconds", 8)
+)
 DOMAIN_DNS_CHECK_INTERVAL_MINUTES = int(
     os.environ.get("domain_dns_check_interval_minutes", 15)
 )
@@ -472,5 +488,13 @@ CELERY_BEAT_SCHEDULE = {
     "check-pending-domains-dns": {
         "task": "providers.tasks.check_pending_domains_dns_task",
         "schedule": timedelta(minutes=DOMAIN_DNS_CHECK_INTERVAL_MINUTES),
+    },
+    "check-catch-all-coverage": {
+        "task": "providers.tasks.check_catch_all_coverage_task",
+        "schedule": timedelta(hours=24),
+    },
+    "redact-old-webhook-payloads": {
+        "task": "providers.tasks.redact_old_webhook_payloads_task",
+        "schedule": timedelta(hours=24),
     },
 }

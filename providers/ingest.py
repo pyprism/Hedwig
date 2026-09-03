@@ -127,7 +127,16 @@ def resolve_mailbox(domain, normalized):
 
 
 def update_thread_for_message(mailbox, message):
-    """Attach ``message`` to an existing thread (matched by headers/subject) or start a new one."""
+    """Attach ``message`` to an existing thread (matched by headers/subject) or start a new one.
+
+    The thread lookup-then-create below (in particular the subject-fallback
+    branch, which has no unique constraint to fall back on) is only race-free
+    because ``create_inbound_message`` — the sole caller — holds a
+    ``select_for_update()`` lock on ``mailbox`` for the whole transaction:
+    that serializes concurrent inbound ingests for the same mailbox, so two
+    messages for a brand-new conversation can't both fail to find an existing
+    thread and each create their own. Do not call this outside that lock.
+    """
     thread = message.thread
     candidate_ids = []
     if message.in_reply_to:
@@ -200,14 +209,25 @@ def update_thread_for_message(mailbox, message):
 
 def create_inbound_message(provider, mailbox, recipient_email, normalized, raw_webhook):
     """Persist a normalized inbound message, or return the existing one if already ingested."""
+    existing = None
     if normalized.provider_message_id:
         existing = EmailMessage.objects.filter(
             provider=provider,
             provider_message_id=normalized.provider_message_id,
             direction=DirectionType.INBOUND,
         ).first()
-        if existing:
-            return existing, False
+    elif normalized.rfc_message_id:
+        # Fall back to the email's own Message-ID header when the provider's
+        # payload doesn't carry its own id (e.g. a variant delivered via a
+        # relay like Hookdeck on retry) — without this, a redelivered webhook
+        # for the same email is fully duplicated with no dedup at any layer.
+        existing = EmailMessage.objects.filter(
+            mailbox=mailbox,
+            rfc_message_id=normalized.rfc_message_id,
+            direction=DirectionType.INBOUND,
+        ).first()
+    if existing:
+        return existing, False
 
     snippet = (normalized.body_text or "").strip().replace("\n", " ")[:500]
     folder = (
@@ -223,13 +243,23 @@ def create_inbound_message(provider, mailbox, recipient_email, normalized, raw_w
     incoming_size = stored_message_size + sum(
         attachment.declared_size for attachment in normalized.attachments
     )
-    if mailbox.quota_bytes and mailbox.used_bytes + incoming_size > mailbox.quota_bytes:
-        raise MailboxQuotaExceeded(
-            f"Mailbox {mailbox.id} quota exceeded "
-            f"({mailbox.used_bytes + incoming_size}/{mailbox.quota_bytes} bytes)."
-        )
 
     with transaction.atomic():
+        # Lock the mailbox row for the rest of this transaction so a
+        # concurrent ingest for the same mailbox (e.g. two Celery workers)
+        # can't both read the same stale used_bytes, both pass the quota
+        # check, and both get admitted over quota. Re-read used_bytes fresh
+        # under the lock rather than trusting the caller-supplied `mailbox`.
+        locked_mailbox = Mailbox.objects.select_for_update().get(pk=mailbox.pk)
+        if (
+            locked_mailbox.quota_bytes
+            and locked_mailbox.used_bytes + incoming_size > locked_mailbox.quota_bytes
+        ):
+            raise MailboxQuotaExceeded(
+                f"Mailbox {mailbox.id} quota exceeded "
+                f"({locked_mailbox.used_bytes + incoming_size}/{locked_mailbox.quota_bytes} bytes)."
+            )
+
         message = EmailMessage.objects.create(
             mailbox=mailbox,
             direction=DirectionType.INBOUND,
@@ -369,21 +399,41 @@ def create_delivery_event(domain, normalized, raw_webhook):
     if message is None:
         return None
 
-    event, created = DeliveryEvent.objects.get_or_create(
-        message=message,
-        event_type=normalized.event_type,
-        recipient=normalized.recipient or "",
-        provider_event_id=normalized.provider_event_id or "",
-        defaults={
-            "reason": normalized.reason,
-            "link_url": normalized.link_url,
-            "occurred_at": normalized.occurred_at or timezone.now(),
-            "metadata": normalized.metadata,
-            "raw_webhook": raw_webhook,
-        },
-    )
-    if not created:
-        return event
+    if normalized.provider_event_id:
+        event, created = DeliveryEvent.objects.get_or_create(
+            message=message,
+            event_type=normalized.event_type,
+            recipient=normalized.recipient or "",
+            provider_event_id=normalized.provider_event_id,
+            defaults={
+                "reason": normalized.reason,
+                "link_url": normalized.link_url,
+                "occurred_at": normalized.occurred_at or timezone.now(),
+                "metadata": normalized.metadata,
+                "raw_webhook": raw_webhook,
+            },
+        )
+        if not created:
+            return event
+    else:
+        # With no provider_event_id to dedupe on (e.g. Postmark opens/clicks
+        # don't always carry one), get_or_create's (message, event_type,
+        # recipient, "") key would collapse every subsequent real open/click
+        # from the same recipient into the first one — silently undercounting
+        # engagement. Always record a new row instead; the DB's
+        # unique_delivery_event_per_provider_event constraint already excludes
+        # the empty-string case, so this can't collide.
+        event = DeliveryEvent.objects.create(
+            message=message,
+            event_type=normalized.event_type,
+            recipient=normalized.recipient or "",
+            provider_event_id="",
+            reason=normalized.reason,
+            link_url=normalized.link_url,
+            occurred_at=normalized.occurred_at or timezone.now(),
+            metadata=normalized.metadata,
+            raw_webhook=raw_webhook,
+        )
 
     new_status = DELIVERY_EVENT_STATUS_MAP.get(normalized.event_type)
     new_rank = EMAIL_STATUS_RANK.get(new_status, 0)
