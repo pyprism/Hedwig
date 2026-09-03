@@ -76,6 +76,37 @@ def test_mailbox_list_estimates_storage_when_cached_usage_is_zero(
     assert response.data["results"][0]["used_bytes"] > 0
 
 
+def test_mailbox_list_used_bytes_estimate_does_not_n_plus_one_on_attachments(
+    django_assert_max_num_queries, api_client, regular_user, mailbox, mailbox_access
+):
+    # Several attachment-bearing messages with no stored size_bytes, each
+    # needing an estimate: get_used_bytes used to run one extra aggregate
+    # query per message inside the loop for these — assert the query count
+    # stays flat instead of scaling with message count.
+    for i in range(5):
+        message = EmailMessage.objects.create(
+            mailbox=mailbox,
+            direction=DirectionType.INBOUND,
+            status=EmailStatus.RECEIVED,
+            folder=Folder.INBOX,
+            from_address="customer@example.com",
+            subject=f"Usage {i}",
+            body_text="x",
+            size_bytes=0,
+            has_attachments=True,
+        )
+        EmailAttachment.objects.create(
+            message=message, filename="f.txt", content_type="text/plain", size_bytes=100
+        )
+    api_client.force_authenticate(regular_user)
+
+    with django_assert_max_num_queries(10):
+        response = api_client.get("/api/mail/mailboxes/")
+
+    assert response.status_code == 200
+    assert response.data["results"][0]["used_bytes"] >= 500
+
+
 def test_thread_counts_respect_user_read_state(
     api_client, regular_user, mailbox, mailbox_access
 ):
