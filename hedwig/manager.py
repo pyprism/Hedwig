@@ -633,7 +633,35 @@ class EmailMessageUserStateQuerySet(models.QuerySet):
 class EmailMessageUserStateManager(
     models.Manager.from_queryset(EmailMessageUserStateQuerySet)
 ):
-    pass
+    def upsert(self, *, user, message, values):
+        """Atomically create-or-update the (user, message) state row, applying
+        only ``values`` on top of it — an existing row's other fields are left
+        untouched, matching a partial PATCH's semantics.
+
+        A plain filter().first() + conditional-insert (the old call-site logic)
+        races under concurrent requests for the same user+message — e.g. a
+        client double-submit or two tabs — and the loser hits the
+        unique_user_message_state constraint as an unhandled IntegrityError.
+        get_or_create wraps the insert attempt in its own transaction and
+        falls back to a get() on a unique-constraint conflict, so the loser
+        gets a normal update instead of a 500; select_for_update() locks the
+        row for the rest of this transaction when it already existed.
+        """
+        with transaction.atomic():
+            state, _created = self.select_for_update().get_or_create(
+                user=user,
+                message=message,
+                defaults={
+                    "folder": message.folder,
+                    "is_read": message.is_read,
+                    "is_starred": message.is_starred,
+                },
+            )
+            for field, value in values.items():
+                setattr(state, field, value)
+            state.last_seen_at = timezone.now()
+            state.save()
+        return state
 
 
 class OutboundSendAttemptQuerySet(models.QuerySet):
