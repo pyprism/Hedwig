@@ -20,32 +20,20 @@ def get_daily_send_limit(domain):
     return min(limits) if limits else None
 
 
-def daily_send_limit_reached(domain):
-    """Check (without reserving) whether ``domain`` has hit its daily send limit."""
-    limit = get_daily_send_limit(domain)
-    if limit is None:
-        return False
-    today = timezone.now().date()
-    log = DailyDomainSendLog.objects.filter(domain=domain, date=today).first()
-    sent_count = log.sent_count if log else 0
-    return sent_count >= limit
+def record_send_failure(domain):
+    """Record a confirmed send failure against today's ``DailyDomainSendLog``.
 
-
-def record_send_result(domain, success):
-    """Record a confirmed send outcome against today's ``DailyDomainSendLog``.
-
-    Called once per message, only after the provider call resolves, so retries
-    of the same attempt don't inflate the count and permanently-failed sends
-    don't count against the limit.
+    Called once per message, only after the provider call resolves. The
+    matching success case doesn't need a separate call: a successful send's
+    slot was already counted by ``reserve_send_slot`` up front.
     """
     today = timezone.now().date()
-    field = "sent_count" if success else "failed_count"
     with transaction.atomic():
         log, _ = DailyDomainSendLog.objects.select_for_update().get_or_create(
             domain=domain, date=today
         )
-        setattr(log, field, models.F(field) + 1)
-        log.save(update_fields=[field])
+        log.failed_count = models.F("failed_count") + 1
+        log.save(update_fields=["failed_count"])
 
 
 def recheck_suppressed_recipients(message):
@@ -101,14 +89,25 @@ def send_with_provider(message, attempt):
     """Reserve a send slot and dispatch ``message`` through its provider."""
     domain = message.mailbox.domain
 
+    # send_enabled/outbound_enabled are only checked at compose time
+    # (SendEmailSerializer scopes the choosable mailbox to send_enabled()).
+    # A message can sit queued for a while (retry backoff, a scheduled_at
+    # days out) during which an admin may disable sending — re-check here,
+    # at actual dispatch time, not just at compose time.
+    if not message.mailbox.send_enabled or not domain.outbound_enabled:
+        error = "Sending is disabled for this mailbox or domain."
+        mark_send_failed(message, attempt, "send_disabled", error)
+        raise PermanentSendError(error)
+
     suppressed = recheck_suppressed_recipients(message)
     if suppressed:
         error = f"Recipient(s) suppressed: {', '.join(sorted(suppressed))}"
         mark_send_failed(message, attempt, "recipient_suppressed", error)
         raise PermanentSendError(error)
 
-    if daily_send_limit_reached(domain):
-        record_send_result(domain, success=False)
+    limit = get_daily_send_limit(domain)
+    if not DailyDomainSendLog.objects.reserve_send_slot(domain, limit):
+        record_send_failure(domain)
         mark_send_failed(
             message,
             attempt,
@@ -117,16 +116,20 @@ def send_with_provider(message, attempt):
         )
         raise PermanentSendError("Daily send limit reached for this domain.")
 
-    materialize_attachments(message)
-
-    provider_impl = get_provider(message.provider or domain.provider)
     try:
+        materialize_attachments(message)
+        provider_impl = get_provider(message.provider or domain.provider)
         result = provider_impl.send(message, attempt)
     except TransientSendError:
-        # Retried by the caller without re-reserving a slot; don't record yet.
+        # Caller retries this same attempt (a fresh call reserves its own
+        # slot), so give back the reservation this call made. Covers both
+        # a provider-level transient failure and materialize_attachments
+        # raising before the provider is ever called (e.g. storage outage) —
+        # either way the reserved slot must not leak.
+        DailyDomainSendLog.objects.release_send_slot(domain)
         raise
     except PermanentSendError:
-        record_send_result(domain, success=False)
+        DailyDomainSendLog.objects.release_send_slot(domain)
+        record_send_failure(domain)
         raise
-    record_send_result(domain, success=True)
     return result
