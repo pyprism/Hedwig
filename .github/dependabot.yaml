@@ -7,3 +7,7 @@ updates:
   target-branch: master
 - package-ecosystem: docker
   directory: "/"
+- package-ecosystem: "github-actions"
+  directory: "/"
+  schedule:
+    interval: "weekly"
