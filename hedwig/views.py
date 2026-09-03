@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.db import transaction, connections
 from django.db.models import Count, FilteredRelation, Prefetch, Q
 from django.db.models.functions import Coalesce
@@ -86,11 +87,21 @@ def _enqueue_send(message, attempt):
     A future-dated send is left ``queued`` with its ``PENDING`` attempt;
     ``dispatch_due_scheduled_sends_task`` (Celery beat) picks it up when due.
     This avoids Celery ``eta``, which on RabbitMQ is held in worker memory and
-    is unreliable across restarts / long horizons. Immediate sends dispatch now.
+    is unreliable across restarts / long horizons (that concern is about
+    delays of hours-to-days, not the short `countdown` below).
+
+    An immediate ("send now") send still isn't dispatched literally instantly:
+    it gets a short `countdown` so `POST .../cancel/` has an actual grace
+    window (Gmail-style "undo send") instead of the task typically already
+    being SENDING/SENT within moments of compose — `cancel_scheduled_send`
+    only succeeds while the attempt is still PENDING.
     """
     if message.scheduled_at and message.scheduled_at > timezone.now():
         return
-    send_email_message_task.apply_async(args=[str(message.id), str(attempt.id)])
+    send_email_message_task.apply_async(
+        args=[str(message.id), str(attempt.id)],
+        countdown=settings.IMMEDIATE_SEND_UNDO_WINDOW_SECONDS,
+    )
 
 
 class StaffWritableScopedModelViewSet(viewsets.ModelViewSet):
@@ -135,6 +146,11 @@ class UserMailboxAccessViewSet(viewsets.ModelViewSet):
     permission_classes = [IsStaffUser]
     ordering_fields = ["granted_at", "expires_at"]
 
+    def get_permissions(self):
+        if self.action == "mine":
+            return [IsAuthenticated(), MustChangePasswordPermission()]
+        return super().get_permissions()
+
     def get_queryset(self):
         return UserMailboxAccess.objects.for_api_user(self.request.user).select_related(
             "user", "mailbox", "domain", "granted_by"
@@ -142,6 +158,24 @@ class UserMailboxAccessViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         serializer.save(granted_by=self.request.user)
+
+    @decorators.action(detail=False, methods=["get"], url_path="mine")
+    def mine(self, request):
+        """Self-service: a non-staff user's own active mailbox/domain access
+        grants — which mailboxes they can see, at what permission level, and
+        when access expires. The write path (create/update/delete) stays
+        staff-only; this only ever returns the caller's own rows."""
+        queryset = (
+            UserMailboxAccess.objects.active()
+            .filter(user=request.user)
+            .select_related("mailbox", "domain", "granted_by")
+            .order_by("-granted_at")
+        )
+        page = self.paginate_queryset(queryset)
+        serializer = self.get_serializer(page or queryset, many=True)
+        if page is not None:
+            return self.get_paginated_response(serializer.data)
+        return response.Response(serializer.data)
 
 
 class EmailThreadViewSet(viewsets.ReadOnlyModelViewSet):
@@ -352,6 +386,15 @@ class EmailMessageViewSet(viewsets.ModelViewSet):
     @decorators.action(detail=True, methods=["post"], url_path="cancel")
     def cancel(self, request, pk=None):
         message = self.get_object()
+        if not (
+            request.user.is_staff
+            or Mailbox.objects.writable_for_user(request.user)
+            .filter(id=message.mailbox_id)
+            .exists()
+        ):
+            raise exceptions.PermissionDenied(
+                "Write access to the mailbox is required."
+            )
         if (
             message.direction != DirectionType.OUTBOUND
             or message.status != EmailStatus.QUEUED
@@ -398,6 +441,47 @@ class EmailMessageViewSet(viewsets.ModelViewSet):
         message.delete()
         return response.Response(status=status.HTTP_204_NO_CONTENT)
 
+    @decorators.action(detail=False, methods=["post"], url_path="bulk-permanent-delete")
+    def bulk_permanent_delete(self, request):
+        """Hard-delete several messages in one request — clearing out spam/trash
+        at scale, or a user cleaning up many stale drafts, otherwise needs one
+        request per message. Same write-access rule as the single-message
+        ``permanent-delete`` action, checked per message's mailbox."""
+        ids = request.data.get("ids")
+        if not isinstance(ids, list) or not ids:
+            raise exceptions.ValidationError(
+                {"ids": ["Provide a non-empty list of message ids."]}
+            )
+
+        messages = list(self.get_queryset().filter(id__in=ids))
+        if len(messages) != len(set(ids)):
+            raise exceptions.NotFound("One or more messages were not found.")
+
+        writable_mailbox_ids = set(
+            Mailbox.objects.writable_for_user(request.user)
+            .filter(id__in={m.mailbox_id for m in messages})
+            .values_list("id", flat=True)
+        )
+        if not request.user.is_staff:
+            unwritable = [
+                m for m in messages if m.mailbox_id not in writable_mailbox_ids
+            ]
+            if unwritable:
+                raise exceptions.PermissionDenied(
+                    "Write access to the mailbox is required for all messages."
+                )
+
+        deleted_count, _ = EmailMessage.objects.filter(
+            id__in=[m.id for m in messages]
+        ).delete()
+        return response.Response({"deleted": len(messages)})
+
+    def _can_write_mailbox(self, user, mailbox_id):
+        return (
+            user.is_staff
+            or Mailbox.objects.writable_for_user(user).filter(id=mailbox_id).exists()
+        )
+
     @decorators.action(detail=True, methods=["patch"], url_path="state")
     def state(self, request, pk=None):
         """Update the requesting user's per-mailbox view of a message (read/starred/folder)."""
@@ -419,27 +503,22 @@ class EmailMessageViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         values = serializer.validated_data
 
-        if values.get("folder") == Folder.TRASH:
+        if values.get("folder") == Folder.TRASH and self._can_write_mailbox(
+            request.user, message.mailbox_id
+        ):
             # Trashing a still-queued scheduled send would otherwise leave it
             # to fire later regardless of the user's per-user folder move —
             # cancel it in place, same as the explicit "Cancel send" action.
+            # Gated on mailbox write access: this mutates the *shared* message/
+            # send-attempt state, not just the caller's per-user view, so a
+            # read-only user trashing their own view must not be able to kill
+            # another user's scheduled send. Without write access the per-user
+            # folder move below still happens; the send itself is left alone.
             EmailMessage.objects.cancel_scheduled_send(message)
 
-        state = EmailMessageUserState.objects.filter(
-            user=request.user, message=message
-        ).first()
-        if state is None:
-            state = EmailMessageUserState(
-                user=request.user,
-                message=message,
-                folder=message.folder,
-                is_read=message.is_read,
-                is_starred=message.is_starred,
-            )
-        for field, value in values.items():
-            setattr(state, field, value)
-        state.last_seen_at = timezone.now()
-        state.save()
+        state = EmailMessageUserState.objects.upsert(
+            user=request.user, message=message, values=values
+        )
         return response.Response(EmailMessageUserStateSerializer(state).data)
 
     @decorators.action(detail=False, methods=["post"], url_path="bulk-state")
@@ -464,9 +543,16 @@ class EmailMessageViewSet(viewsets.ModelViewSet):
 
         if values.get("folder") == Folder.TRASH:
             # See EmailMessageViewSet.state: bulk-trashing must cancel any
-            # still-queued scheduled sends in the batch too.
+            # still-queued scheduled sends in the batch too, gated the same
+            # way on mailbox write access.
+            writable_mailbox_ids = set(
+                Mailbox.objects.writable_for_user(request.user)
+                .filter(id__in={m.mailbox_id for m in messages})
+                .values_list("id", flat=True)
+            )
             for message in messages:
-                EmailMessage.objects.cancel_scheduled_send(message)
+                if request.user.is_staff or message.mailbox_id in writable_mailbox_ids:
+                    EmailMessage.objects.cancel_scheduled_send(message)
 
         # Batched: one query to load existing states, then a single bulk_create
         # and a single bulk_update instead of a SELECT+SAVE per message (N+1).
