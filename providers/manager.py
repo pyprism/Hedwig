@@ -1,4 +1,5 @@
-from django.db import models
+from django.db import models, transaction
+from django.db.models.functions import Greatest
 from django.utils import timezone
 
 from utils.enums import ProviderType
@@ -85,7 +86,36 @@ class DailyDomainSendLogQuerySet(models.QuerySet):
 class DailyDomainSendLogManager(
     models.Manager.from_queryset(DailyDomainSendLogQuerySet)
 ):
-    pass
+    def reserve_send_slot(self, domain, limit):
+        """Atomically check-and-increment today's ``sent_count`` for ``domain``,
+        returning ``True`` iff the slot was reserved.
+
+        A plain "read sent_count, then increment later" (the old call-site
+        logic in ``providers.sending``) races: multiple sends near the daily
+        cap dispatched concurrently by different Celery workers can all read
+        the same stale count and all pass the check before any of them
+        records. ``select_for_update`` serializes concurrent reservations for
+        the same (domain, date) row; the lock is held only for this brief
+        atomic block, not across the actual provider API call.
+        """
+        today = timezone.now().date()
+        with transaction.atomic():
+            log, _ = self.select_for_update().get_or_create(domain=domain, date=today)
+            if limit is not None and log.sent_count >= limit:
+                return False
+            log.sent_count = models.F("sent_count") + 1
+            log.save(update_fields=["sent_count"])
+        return True
+
+    def release_send_slot(self, domain):
+        """Give back a reservation from ``reserve_send_slot`` — the send
+        turned out to be a permanent failure or needs a transient-error retry,
+        neither of which should count against the daily limit."""
+        today = timezone.now().date()
+        with transaction.atomic():
+            self.select_for_update().filter(domain=domain, date=today).update(
+                sent_count=Greatest(models.F("sent_count") - 1, 0)
+            )
 
 
 class ProviderWebhookLogQuerySet(models.QuerySet):
