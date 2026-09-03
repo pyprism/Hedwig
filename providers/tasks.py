@@ -1,3 +1,4 @@
+import logging
 from datetime import timedelta
 
 from celery import shared_task
@@ -5,6 +6,7 @@ from django.conf import settings
 from django.db import models
 from django.utils import timezone
 
+from providers.catch_all_coverage import find_domains_missing_catch_all
 from providers.ingest import process_webhook_log
 from providers.models import (
     DailyDomainSendLog,
@@ -14,6 +16,8 @@ from providers.models import (
 )
 from providers.registry import get_provider
 from utils.enums import DomainStatus, ProviderWebhookStatus
+
+logger = logging.getLogger(__name__)
 
 RETRYABLE_STATUSES = {
     ProviderWebhookStatus.PENDING,
@@ -29,21 +33,49 @@ def process_webhook_log_task(self, webhook_log_id):
     Uses ``locked_at``/``attempt_count`` so a row already marked processed/ignored by
     a previous delivery of this task is not reprocessed.
     """
-    raw_webhook = (
-        ProviderWebhookLog.objects.select_related("provider", "domain")
-        .filter(pk=webhook_log_id)
-        .first()
+    # Claim the row with a single conditional UPDATE instead of a plain
+    # read-then-save: a WHERE ... UPDATE is atomic at the row level, so two
+    # concurrent deliveries of this task for the same webhook_log_id (e.g. a
+    # broker redelivery landing alongside the stale-retry sweep) can't both
+    # read "retryable" and both proceed to process it — only the first UPDATE
+    # actually matches and flips the row.
+    #
+    # A row already PROCESSING is only reclaimable if its lock has gone
+    # stale (same threshold retry_stale_webhook_logs_task uses to decide a
+    # row is worth re-dispatching) — otherwise a merely-slow-but-still-alive
+    # task (e.g. a large attachment upload) would get double-processed by a
+    # second delivery that finds status==PROCESSING and, before this check
+    # existed, reclaimed it anyway just because PROCESSING was unconditionally
+    # in RETRYABLE_STATUSES.
+    stale_before = timezone.now() - timedelta(
+        minutes=settings.WEBHOOK_LOG_RETRY_STALE_MINUTES
     )
-    if raw_webhook is None:
-        return {"status": "missing", "id": str(webhook_log_id)}
-
-    if raw_webhook.status not in RETRYABLE_STATUSES:
+    claimed = (
+        ProviderWebhookLog.objects.filter(pk=webhook_log_id)
+        .filter(
+            models.Q(
+                status__in={ProviderWebhookStatus.PENDING, ProviderWebhookStatus.FAILED}
+            )
+            | models.Q(
+                status=ProviderWebhookStatus.PROCESSING,
+                locked_at__lt=stale_before,
+            )
+        )
+        .update(
+            status=ProviderWebhookStatus.PROCESSING,
+            locked_at=timezone.now(),
+            attempt_count=models.F("attempt_count") + 1,
+        )
+    )
+    if not claimed:
+        raw_webhook = ProviderWebhookLog.objects.filter(pk=webhook_log_id).first()
+        if raw_webhook is None:
+            return {"status": "missing", "id": str(webhook_log_id)}
         return {"status": raw_webhook.status, "id": str(webhook_log_id)}
 
-    raw_webhook.status = ProviderWebhookStatus.PROCESSING
-    raw_webhook.locked_at = timezone.now()
-    raw_webhook.attempt_count += 1
-    raw_webhook.save(update_fields=["status", "locked_at", "attempt_count"])
+    raw_webhook = ProviderWebhookLog.objects.select_related("provider", "domain").get(
+        pk=webhook_log_id
+    )
 
     try:
         raw_webhook = process_webhook_log(raw_webhook)
@@ -153,3 +185,46 @@ def cleanup_daily_send_logs_task():
     )
     deleted, _ = DailyDomainSendLog.objects.filter(date__lt=cutoff).delete()
     return {"deleted": deleted}
+
+
+@shared_task
+def redact_old_webhook_payloads_task():
+    """Beat entry point: blank out ``payload``/``headers`` on webhook logs
+    older than ``WEBHOOK_LOG_PAYLOAD_RETENTION_DAYS``.
+
+    Raw payloads duplicate storage already retained elsewhere (message bodies
+    live on ``EmailMessage``, attachment bytes in S3 via ``EmailAttachment``)
+    and can carry full email content indefinitely with no equivalent of
+    ``cleanup_daily_send_logs_task``. Only rows past ``RETRYABLE_STATUSES``
+    are touched, so nothing still eligible for the stale-retry sweep loses
+    the payload it needs to be reprocessed.
+    """
+    cutoff = timezone.now() - timedelta(
+        days=settings.WEBHOOK_LOG_PAYLOAD_RETENTION_DAYS
+    )
+    updated = (
+        ProviderWebhookLog.objects.filter(received_at__lt=cutoff)
+        .exclude(status__in=RETRYABLE_STATUSES)
+        .exclude(payload={}, headers={})
+        .update(payload={}, headers={})
+    )
+    return {"redacted": updated}
+
+
+@shared_task
+def check_catch_all_coverage_task():
+    """Beat entry point: log a warning for every domain with receive-enabled
+    mailboxes but no catch-all — otherwise mail to an unrecognized address is
+    dropped with nothing visible beyond a webhook log row. See
+    ``providers.catch_all_coverage`` and the ``check_catch_all_coverage``
+    management command (same logic, for ad hoc/CI use)."""
+    flagged = find_domains_missing_catch_all(days=7)
+    for domain, mailbox_count, dropped_count in flagged:
+        logger.warning(
+            "Domain %s has %d receive-enabled mailbox(es) but no catch-all mailbox; "
+            "%d message(s) dropped for 'no mailbox matched' in the last 7 days",
+            domain.name,
+            mailbox_count,
+            dropped_count,
+        )
+    return {"flagged_domains": len(flagged)}
