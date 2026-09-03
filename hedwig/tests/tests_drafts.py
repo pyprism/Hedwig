@@ -97,6 +97,53 @@ def test_update_draft_replaces_attachments(authed_client, mailbox):
     assert message.attachments.get().filename == "b.txt"
 
 
+def test_partial_update_preserves_recipients_not_in_payload(authed_client, mailbox):
+    create = authed_client.post(
+        DRAFT_URL,
+        {
+            "mailbox": str(mailbox.id),
+            "to": [{"email": "keep@example.com"}],
+            "cc": [{"email": "keep-cc@example.com"}],
+            "subject": "Original",
+        },
+        format="json",
+    )
+    draft_id = create.data["id"]
+    created = EmailMessage.objects.get(pk=draft_id)
+    assert [row["email"] for row in created.to_addresses] == ["keep@example.com"]
+
+    response = authed_client.patch(
+        _draft_url(draft_id),
+        {"subject": "Updated later"},
+        format="json",
+    )
+
+    assert response.status_code == 200
+    message = EmailMessage.objects.get(pk=draft_id)
+    assert message.subject == "Updated later"
+    assert [row["email"] for row in message.to_addresses] == ["keep@example.com"]
+    assert [row["email"] for row in message.cc_addresses] == ["keep-cc@example.com"]
+
+
+def test_partial_update_can_still_clear_recipients_explicitly(authed_client, mailbox):
+    create = authed_client.post(
+        DRAFT_URL,
+        {"mailbox": str(mailbox.id), "to": [{"email": "drop@example.com"}]},
+        format="json",
+    )
+    draft_id = create.data["id"]
+
+    response = authed_client.patch(
+        _draft_url(draft_id),
+        {"to": []},
+        format="json",
+    )
+
+    assert response.status_code == 200
+    message = EmailMessage.objects.get(pk=draft_id)
+    assert message.to_addresses == []
+
+
 def test_owner_can_delete_own_draft(authed_client, mailbox):
     create = authed_client.post(
         DRAFT_URL, {"mailbox": str(mailbox.id), "subject": "Bye"}, format="json"
