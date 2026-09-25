@@ -19,5 +19,5 @@ django-cors-headers==4.9.0
 coverage==7.16.0
 inflection==0.5.1
 uritemplate==4.2.0
-ruff==0.15.17
+ruff==0.16.8
 PyYAML==6.0.3
