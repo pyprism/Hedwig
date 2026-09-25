@@ -12,7 +12,7 @@ pytest-django==4.12.0
 requests-mock==1.12.1
 markdown==3.10.2
 djangorestframework==3.18.0
-django-filter==25.2
+django-filter==26.1
 django-storages[s3]==1.14.6
 djangorestframework-simplejwt==5.5.1
 django-cors-headers==4.9.0
